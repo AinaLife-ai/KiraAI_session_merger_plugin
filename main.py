@@ -735,8 +735,9 @@ class SessionMergerPlugin(BasePlugin):
         """可重复调用：合并启用时强制安装/升级 ROUTE 包装。"""
         if not self.enabled:
             return
-        llm_api = getattr(self.ctx, "llm_api", None)
-        fn = getattr(llm_api, "tools_functions", {}).get("session_send") if llm_api else None
+        tool_mgr = getattr(self.ctx, "tool_mgr", None)
+        ss_tool = tool_mgr.tool_set.get("session_send") if tool_mgr is not None else None
+        fn = getattr(ss_tool, "_func", None) if ss_tool is not None else None
         ver = getattr(fn, "_merger_session_send_version", 0) if fn else 0
         if (
             fn
@@ -755,10 +756,11 @@ class SessionMergerPlugin(BasePlugin):
         session_send 工具也改成 ROUTE 函数，否则本轮仍跑旧直达逻辑。
         """
         self._ensure_session_send_wrap()
-        llm_api = getattr(self.ctx, "llm_api", None)
-        if not llm_api:
+        tool_mgr = getattr(self.ctx, "tool_mgr", None)
+        ss_tool = tool_mgr.tool_set.get("session_send") if tool_mgr is not None else None
+        route_fn = getattr(ss_tool, "_func", None) if ss_tool is not None else None
+        if not route_fn:
             return False
-        route_fn = llm_api.tools_functions.get("session_send")
         if not route_fn or not getattr(route_fn, "_merger_session_send_wrapped", False):
             return False
         if getattr(route_fn, "_merger_session_send_version", 0) < self._SESSION_SEND_WRAP_VERSION:
@@ -791,12 +793,13 @@ class SessionMergerPlugin(BasePlugin):
         合并模式接管 session_send = 跨会话请求路由：
         切换到目标会话并激活 LLM，目标侧带着合并上文继续执行。
         """
-        llm_api = getattr(self.ctx, "llm_api", None)
-        if not llm_api or not hasattr(llm_api, "tools_functions"):
-            logger.warning("[MERGER] cannot wrap session_send: llm_api missing")
+        tool_mgr = getattr(self.ctx, "tool_mgr", None)
+        if tool_mgr is None or not hasattr(tool_mgr, "tool_set"):
+            logger.warning("[MERGER] cannot wrap session_send: tool_mgr missing")
             return
 
-        current = llm_api.tools_functions.get("session_send")
+        ss_tool = tool_mgr.tool_set.get("session_send")
+        current = getattr(ss_tool, "_func", None) if ss_tool is not None else None
         if current is None:
             logger.warning(
                 "[MERGER] session_send not registered yet; will retry on next llm_request"
@@ -878,7 +881,8 @@ class SessionMergerPlugin(BasePlugin):
             self._SESSION_SEND_WRAP_VERSION
         )
         wrapped_session_send._merger_session_send_original = original  # type: ignore
-        llm_api.tools_functions["session_send"] = wrapped_session_send
+        if ss_tool is not None and hasattr(ss_tool, "_func"):
+            ss_tool._func = wrapped_session_send
         # target 示例按本机启用中的 adapter 动态生成，避免 LLM 照抄不存在的 qq 前缀
         target_examples = "target 从会话列表原样复制，勿自行拼接前缀"
         try:
@@ -892,7 +896,7 @@ class SessionMergerPlugin(BasePlugin):
         except Exception:
             pass
         try:
-            for td in getattr(llm_api, "tools_definitions", []) or []:
+            for td in tool_mgr.tool_set.to_list():
                 fn = td.get("function") or {}
                 if fn.get("name") == "session_send":
                     fn["description"] = (
