@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.6.1** · 适用于 KiraAI `core >= 2.6.1`
+**版本 2.6.2** · 适用于 KiraAI `core >= 2.6.1`
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 
@@ -277,6 +277,10 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.6.2
+
+- **适配新版工具注册机制，修复跨会话路由失效**：KiraAI 更新后工具改由 `ctx.tool_mgr`（`tool_set`）统一管理，`ctx.llm_api.tools_functions` 不再可靠，导致插件包装 `session_send` 时取不到工具函数，日志持续报 `cannot wrap session_send: llm_api missing`，跨会话路由直接失效。已将 5 处 `ctx.llm_api` 全部改为 `ctx.tool_mgr`（工具从 `tool_set` 取 `_func` 包装），路由恢复正常
 
 ### 2.6.1
 
