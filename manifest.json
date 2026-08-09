@@ -5,7 +5,7 @@
   "author": "znq19",
   "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。v2.6.2：适配新版 tool_mgr 工具注册，修复跨会话路由失效。",
   "repo": "https://github.com/znq19/KiraAI_session_merger_plugin",
-  "core_version": ">=2.6.1",
+  "core_version": ">=2.29.6",
   "tags": [
     "memory",
     "session"
