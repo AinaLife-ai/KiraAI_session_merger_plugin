@@ -192,6 +192,52 @@ def resolve_target_sid(ctx, target: str) -> Tuple[Optional[str], Optional[str]]:
     )
 
 
+def check_session_send_permission(ctx, target: str) -> Optional[str]:
+    """
+    跨会话目标白/黑名单检查（与官方 builtin session_tools 的 session_send 一致）：
+    - adapter.permission_mode == allow_list：目标必须在其 user_list/group_list 中；
+    - adapter.permission_mode == deny_list：目标必须不在列表中。
+    兼容策略（避免破坏老部署）：
+    - adapter 不存在或旧框架无 permission_mode 属性 → 不拦截，交给 resolve 处理；
+    - allow_list 且对应列表为空 → 视为未配置白名单，不拦截
+      （官方语义下空 allow_list 会拒绝全部跨会话，这里保持宽容）；
+    - 其它未知模式 → 不拦截。
+    返回 None 表示允许，否则返回 Permission denied 错误消息。
+    """
+    parts = (target or "").split(":")
+    if len(parts) != 3 or not all(parts):
+        return None  # 格式错误交给 resolve_target_sid 处理
+    ada_name, session_type, session_id = parts
+    mgr = getattr(ctx, "adapter_mgr", None)
+    if mgr is None:
+        return None
+    try:
+        adapter = mgr.get_adapter(ada_name)
+    except Exception:
+        adapter = None
+    if adapter is None:
+        return None  # 不存在交给 resolve 报错/前缀校正
+    permission_mode = getattr(adapter, "permission_mode", None)
+    if permission_mode not in ("allow_list", "deny_list"):
+        return None
+    try:
+        target_list = getattr(
+            adapter, "user_list" if session_type == "dm" else "group_list", None
+        ) or []
+        target_is_listed = session_id in {str(item) for item in target_list}
+    except Exception:
+        return None
+    if permission_mode == "allow_list":
+        if not target_list:
+            return None  # 空白名单视为未配置，不拦截
+        is_allowed = target_is_listed
+    else:  # deny_list
+        is_allowed = not target_is_listed
+    if not is_allowed:
+        return f"Permission denied: target session is not allowed by adapter {ada_name}"
+    return None
+
+
 async def route_cross_session_request(
     ctx,
     source_sid: str,
@@ -219,6 +265,14 @@ async def route_cross_session_request(
             "failed: target is current session; "
             "output xml directly here, do not use session_send."
         )
+
+    perm_err = check_session_send_permission(ctx, target)
+    if perm_err:
+        if logger:
+            logger.warning(
+                "[MERGER] route rejected %s -> %s: %s", source_sid, target, perm_err
+            )
+        return False, perm_err
 
     try:
         notice = build_route_notice_text(source_sid or "unknown", description)
