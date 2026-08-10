@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.6.2** · 适用于 KiraAI `core >= 2.29.6`
+**版本 2.6.3** · 适用于 KiraAI `core >= 2.29.6`
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 
@@ -80,6 +80,10 @@ KiraAI 默认行为：**每个群聊、每个私聊各自独立记忆**，换一
 2. 目标窗口带着全部上文继续执行
 3. 源窗口本轮结束
 4. 短时间内重复路由会被拦截
+5. 目标会话受适配器黑白名单约束（与官方 session_send 一致）：
+   - `permission_mode=allow_list`：仅允许路由到 `user_list` / `group_list` 内的会话；
+   - `permission_mode=deny_list`：禁止路由到列表内的会话；
+   - 列表为空视为未配置，不拦截（老部署不受影响）。
 
 ---
 
@@ -277,6 +281,10 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.6.3
+
+- **跨会话路由对齐官方 session_send 黑白名单检查**：KSM 接管 `session_send` 后原版的适配器权限检查（`permission_mode=allow_list` / `deny_list` + `user_list` / `group_list`）被绕过，本版在 `route_cross_session_request` 的目标校正后补回同等检查；空列表视为未配置放行，避免默认配置（allow_list + 空列表）下全部跨会话被拒、破坏老部署
 
 ### 2.6.2
 
