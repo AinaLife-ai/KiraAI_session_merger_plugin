@@ -59,6 +59,7 @@ class HistoryToolService:
         circuit_fail_threshold: int = 2,
         circuit_open_sec: float = 60.0,
         use_ws: bool = True,
+        ctx=None,
         logger=None,
     ):
         self.http_host = http_host or "localhost"
@@ -72,6 +73,9 @@ class HistoryToolService:
         self.circuit_fail_threshold = max(1, int(circuit_fail_threshold or 2))
         self.circuit_open_sec = max(0.0, float(circuit_open_sec or 60.0))
         self.use_ws = bool(use_ws)
+        # Plugin context: needed by _get_client to resolve the adapter's WS
+        # client (same ID namespace as the adapter, so message IDs work).
+        self.ctx = ctx
         self.logger = logger
         self._call_cache: Dict[str, Dict[str, Any]] = {}
         self._fail_streak = 0
