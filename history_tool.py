@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 import traceback
 from typing import Any, Dict, List, Optional
@@ -9,12 +10,29 @@ import httpx
 from core.chat.message_utils import KiraMessageBatchEvent
 
 
+# Placeholder raw_message produced by some OneBot implementations (e.g.
+# SnowLuma) when the reply segment conversion fails - the message content
+# is actually empty and must be rebuilt from segments or get_msg.
+_PLACEHOLDER_RAW = {"[引用消息]", "[空消息]", ""}
+# Segment types whose source (url/file) may be missing in stored history
+# and needs a get_msg refresh (SnowLuma refreshes image URLs on get_msg).
+_MEDIA_TYPES = {"image", "record", "video"}
+# Max messages to refresh per call (get_msg is one round-trip each).
+_MAX_REFRESH = 10
+
+
 class HistoryToolService:
     """
-    OneBot HTTP 历史查询。
+    跨会话历史查询（对齐新版 history_plugin v1.3.2 强解析能力）。
 
-    对齐 history_plugin：任何失败只 return str，绝不抛异常。
-    额外：全局熔断，连续失败后短时间直接拒绝，避免拖慢 agent。
+    - WS 通道优先（复用适配器连接，与转发/撤回同一 ID 命名空间，
+      SnowLuma 下 get_msg 可反查），HTTP 通道兜底。
+    - 强解析：raw_message 为占位（如 SnowLuma 的 [引用消息]）时改用
+      message 段数组；reply 段显示 [引用 msg_id:xxx]；媒体缺源标记待刷新。
+    - get_msg 批量刷新（最多 10 条/次）恢复媒体 URL。
+    - 空引用占位消息渲染后判定过滤，不污染 LLM 上下文。
+    - 保留 KSM 特有：全局熔断、同回合调用限制、缓存、权限控制、截断。
+    任何失败只 return str，绝不抛异常。
     """
 
     # 本地 OneBot 拉取历史消息（尤其群聊大 count）可能耗时数秒，
@@ -40,6 +58,7 @@ class HistoryToolService:
         cache_ttl_sec: int = 120,
         circuit_fail_threshold: int = 2,
         circuit_open_sec: float = 60.0,
+        use_ws: bool = True,
         logger=None,
     ):
         self.http_host = http_host or "localhost"
@@ -52,6 +71,7 @@ class HistoryToolService:
         self.cache_ttl_sec = max(0, int(cache_ttl_sec or 0))
         self.circuit_fail_threshold = max(1, int(circuit_fail_threshold or 2))
         self.circuit_open_sec = max(0.0, float(circuit_open_sec or 60.0))
+        self.use_ws = bool(use_ws)
         self.logger = logger
         self._call_cache: Dict[str, Dict[str, Any]] = {}
         self._fail_streak = 0
@@ -96,43 +116,205 @@ class HistoryToolService:
             typ = "dm"
         return {"adapter": "qq", "session_type": typ, "session_id": sid, "full": f"qq:{typ}:{sid}"}
 
+    # ---------- 强解析（对齐 history_plugin v1.3.2） ----------
+
+    @staticmethod
+    def _segments_to_text(msg_segments) -> str:
+        """Render message segments to text, keeping media URLs and reply IDs."""
+        parts = []
+        for seg in msg_segments:
+            seg_type = seg.get("type")
+            seg_data = seg.get("data", {})
+            if seg_type == "text":
+                parts.append(seg_data.get("text", ""))
+            elif seg_type == "at":
+                parts.append(f"@{seg_data.get('qq', 'someone')}")
+            elif seg_type == "face":
+                parts.append("[表情]")
+            elif seg_type == "image":
+                img_url = seg_data.get("url", "")
+                if img_url:
+                    parts.append(f"[图片]({img_url})")
+                else:
+                    parts.append("[图片]")
+            elif seg_type == "video":
+                parts.append("[视频]")
+            elif seg_type == "file":
+                file_name = seg_data.get("name", "文件")
+                parts.append(f"[文件]{file_name}")
+            elif seg_type == "reply":
+                rid = seg_data.get("id", "")
+                parts.append(f"[引用 msg_id:{rid}]" if rid else "[引用]")
+            elif seg_type == "forward":
+                parts.append("[转发消息]")
+            else:
+                parts.append(f"[{seg_type}]")
+        return " ".join(parts)
+
     def _message_to_text(self, msg: dict) -> str:
-        if msg.get("raw_message"):
-            content = msg["raw_message"]
+        """Convert a message to formatted text. Uses raw_message only when it
+        is real content; placeholder raw_message (e.g. SnowLuma's
+        "[引用消息]") falls back to the segment array."""
+        raw = (msg.get("raw_message") or "").strip()
+        if raw and raw not in _PLACEHOLDER_RAW:
+            content = raw
         else:
             msg_segments = msg.get("message", [])
             if not msg_segments:
                 content = "[空消息]"
             else:
-                parts = []
-                for seg in msg_segments:
-                    seg_type = seg.get("type")
-                    seg_data = seg.get("data", {})
-                    if seg_type == "text":
-                        parts.append(seg_data.get("text", ""))
-                    elif seg_type == "at":
-                        parts.append(f"@{seg_data.get('qq', 'someone')}")
-                    elif seg_type == "face":
-                        parts.append("[表情]")
-                    elif seg_type == "image":
-                        img_url = seg_data.get("url", "")
-                        parts.append(f"[图片]({img_url})" if img_url else "[图片]")
-                    elif seg_type == "video":
-                        parts.append("[视频]")
-                    elif seg_type == "file":
-                        parts.append(f"[文件]{seg_data.get('name', '文件')}")
-                    elif seg_type == "reply":
-                        parts.append("[回复]")
-                    elif seg_type == "forward":
-                        parts.append("[转发消息]")
-                    else:
-                        parts.append(f"[{seg_type}]")
-                content = " ".join(parts)
+                content = self._segments_to_text(msg_segments)
 
         msg_id = msg.get("message_id")
         if msg_id:
             content += f" (msg_id:{msg_id})"
         return content
+
+    def _is_placeholder(self, msg: dict) -> bool:
+        """True when the message renders as a placeholder (empty quote) and
+        carries no real content - SnowLuma stores reply-conversion failures
+        as such (raw_message = "[引用消息]" with empty/placeholder segments).
+        Filtering these keeps the LLM context clean."""
+        raw = (msg.get("raw_message") or "").strip()
+        segs = msg.get("message") or []
+        # Placeholder raw_message (non-empty) marks a conversion failure.
+        if raw and raw in _PLACEHOLDER_RAW:
+            return True
+        # Empty raw_message is normal for segment-based messages - only
+        # filter when there is genuinely no content at all.
+        if not raw and not segs:
+            return True
+        # Render the content; if it is empty or a pure placeholder after
+        # stripping the trailing (msg_id:xxx), the message is not real.
+        content = self._message_to_text(msg)
+        content = re.sub(r"\s*\(msg_id:-?\d+\)\s*$", "", content).strip()
+        if not content:
+            return True
+        if content in ("[空消息]", "[引用消息]", "[引用]", "[转发消息]"):
+            return True
+        return False
+
+    def _needs_refresh(self, msg: dict) -> bool:
+        """True when the message needs a get_msg refresh: placeholder
+        raw_message, or media segments without a usable source."""
+        raw = (msg.get("raw_message") or "").strip()
+        if raw in _PLACEHOLDER_RAW:
+            return True
+        for seg in msg.get("message") or []:
+            if seg.get("type") in _MEDIA_TYPES:
+                data = seg.get("data") or {}
+                if not (data.get("url") or data.get("file") or data.get("file_id")):
+                    return True
+        return False
+
+    # ---------- 通道 ----------
+
+    def _get_client(self, event):
+        """Get the adapter WS client from the event (same ID namespace as
+        the adapter itself, so message IDs are usable by get_msg / forward)."""
+        try:
+            info = getattr(event, "adapter", None)
+            if info is None:
+                return None
+            name = getattr(info, "name", None) or getattr(info, "adapter_id", None)
+            if not name:
+                return None
+            adapter = self.ctx.adapter_mgr.get_adapter(name)
+            if adapter is None:
+                return None
+            return adapter.get_client()
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[history_tool] get client failed: {e}")
+            return None
+
+    async def _fetch_ws(self, client, session_type: str, session_id: str, count: int):
+        """Fetch history via the WS channel (adapter's own OneBot connection)."""
+        try:
+            if session_type == "gm":
+                resp = await client.send_action(
+                    "get_group_msg_history",
+                    {"group_id": int(session_id), "count": count},
+                    timeout=15,
+                )
+            else:
+                resp = await client.send_action(
+                    "get_friend_msg_history",
+                    {"user_id": int(session_id), "count": count},
+                    timeout=15,
+                )
+            if isinstance(resp, dict) and resp.get("status") == "ok":
+                return resp.get("data", {}).get("messages") or []
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[history_tool] WS history failed: {e}")
+        return None
+
+    async def _fetch_http(self, session_type: str, session_id: str, count: int):
+        """Fetch history via the HTTP service (legacy channel)."""
+        try:
+            if session_type == "gm":
+                api = "get_group_msg_history"
+                params = {"group_id": int(session_id), "count": count}
+            else:
+                api = "get_friend_msg_history"
+                params = {"user_id": int(session_id), "count": count}
+
+            headers = {}
+            if self.access_token:
+                headers["Authorization"] = f"Bearer {self.access_token}"
+
+            timeout = httpx.Timeout(
+                connect=self.CONNECT_TIMEOUT,
+                read=self.READ_TIMEOUT,
+                write=self.READ_TIMEOUT,
+                pool=self.CONNECT_TIMEOUT,
+            )
+
+            url = f"{self.base_url}/{api}"
+            if self.logger:
+                self.logger.info("[history_tool] fetching %s params=%s", url, params)
+
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, json=params, headers=headers)
+                if resp.status_code >= 400:
+                    err = (
+                        f"Error: HTTP {resp.status_code} from {url}/{api}. "
+                        "OneBot HTTP 不可用。请勿再次调用 get_session_history，"
+                        "请基于当前对话上下文回答。"
+                    )
+                    if self.logger:
+                        self.logger.error("Error fetching history: HTTP %s body=%s", resp.status_code, resp.text[:200])
+                    return None, err
+                try:
+                    result = resp.json()
+                except Exception as e:
+                    err = f"Error: invalid JSON from OneBot ({e}) body={resp.text[:200]}"
+                    return None, err
+
+            if result.get("status") != "ok":
+                err = f"Failed: {result.get('message', 'unknown error')}"
+                return None, err
+            return result.get("data", {}).get("messages", []), None
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e) or '(no message)'}"
+            return None, err
+
+    async def _get_msg_ws(self, client, message_id) -> dict | None:
+        """Fetch a single message via get_msg (SnowLuma refreshes image URLs
+        on get_msg, so this recovers media sources missing from history)."""
+        try:
+            resp = await client.send_action(
+                "get_msg", {"message_id": message_id}, timeout=15
+            )
+            if isinstance(resp, dict) and resp.get("status") == "ok":
+                return resp.get("data") or {}
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[history_tool] get_msg({message_id}) failed: {e}")
+        return None
+
+    # ---------- 缓存 / 熔断 / 限制（KSM 保留） ----------
 
     def _cache_put(self, key: str, count: int, data: str, is_error: bool = False):
         self._call_cache[key] = {
@@ -300,67 +482,75 @@ class HistoryToolService:
             if hit is not None:
                 return hit
 
-            if st == "gm":
-                api = "get_group_msg_history"
-                params = {"group_id": int(entity), "count": count}
-            else:
-                api = "get_friend_msg_history"
-                params = {"user_id": int(entity), "count": count}
+            # ---------- 拉取历史：WS 通道优先，HTTP 兜底 ----------
+            messages = None
+            err = None
+            client = None
+            if self.use_ws:
+                client = self._get_client(event)
+                if client is not None:
+                    messages = await self._fetch_ws(client, st, entity, count)
+                    if messages is None:
+                        if self.logger:
+                            self.logger.warning(
+                                "[history_tool] WS fetch failed for %s; falling back to HTTP",
+                                cache_key,
+                            )
+            if messages is None:
+                messages, err = await self._fetch_http(st, entity, count)
 
-            headers = {}
-            if self.access_token:
-                headers["Authorization"] = f"Bearer {self.access_token}"
-
-            timeout = httpx.Timeout(
-                connect=self.CONNECT_TIMEOUT,
-                read=self.READ_TIMEOUT,
-                write=self.READ_TIMEOUT,
-                pool=self.CONNECT_TIMEOUT,
-            )
-
-            url = f"{self.base_url}/{api}"
-            if self.logger:
-                self.logger.info("[history_tool] fetching %s params=%s", url, params)
-
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(url, json=params, headers=headers)
-                if resp.status_code >= 400:
-                    err = (
-                        f"Error: HTTP {resp.status_code} from {url}/{api}. "
-                        "OneBot HTTP 不可用。请勿再次调用 get_session_history，"
-                        "请基于当前对话上下文回答。"
-                    )
-                    if self.logger:
-                        self.logger.error("Error fetching history: HTTP %s body=%s", resp.status_code, resp.text[:200])
-                    self._cache_put(cache_key, 80, err, is_error=True)
-                    self._note_failure()
-                    return err
-                try:
-                    result = resp.json()
-                except Exception as e:
-                    err = f"Error: invalid JSON from OneBot ({e}) body={resp.text[:200]}"
-                    self._cache_put(cache_key, 80, err, is_error=True)
-                    self._note_failure()
-                    return err
-
-            if result.get("status") != "ok":
-                err = f"Failed: {result.get('message', 'unknown error')}"
+            if err is not None:
                 self._cache_put(cache_key, 80, err, is_error=True)
                 self._note_failure()
                 return err
 
-            messages = result.get("data", {}).get("messages", [])
             if not messages:
                 empty = "该会话暂无历史消息。"
                 self._cache_put(cache_key, count, empty, is_error=False)
                 self._note_success()
                 return empty
 
+            # ---------- get_msg 批量刷新（最多 10 条/次） ----------
+            if client is not None:
+                target = messages[-count:]
+                refreshed = 0
+                for i, m in enumerate(target):
+                    if refreshed >= _MAX_REFRESH:
+                        break
+                    if self._needs_refresh(m):
+                        mid = m.get("message_id")
+                        if mid is not None:
+                            fresh = await self._get_msg_ws(client, mid)
+                            if fresh and fresh.get("message"):
+                                target[i] = fresh
+                                refreshed += 1
+                if refreshed and self.logger:
+                    self.logger.info(
+                        "[history_tool] refreshed %d messages via get_msg", refreshed
+                    )
+
+            # ---------- 格式化 + 空引用占位过滤 ----------
             formatted = []
+            skipped = 0
             for msg in messages[-count:]:
+                if self._is_placeholder(msg):
+                    skipped += 1
+                    continue
                 sender = msg.get("sender", {}).get("nickname", "Unknown")
                 content = self._message_to_text(msg)
                 formatted.append(f"{sender}: {content}")
+
+            if skipped and self.logger:
+                self.logger.info(
+                    "[history_tool] filtered %d unresolvable placeholder messages",
+                    skipped,
+                )
+
+            if not formatted:
+                empty = "该会话暂无有效历史消息。"
+                self._cache_put(cache_key, count, empty, is_error=False)
+                self._note_success()
+                return empty
 
             result_text = self._truncate_result("\n".join(formatted))
             self._cache_put(cache_key, count, result_text, is_error=False)

@@ -423,6 +423,9 @@ class SessionMergerPlugin(BasePlugin):
         # 熔断参数：默认 60s（用户反馈 120s 太长）
         self.circuit_fail_threshold = int(hist.get("circuit_fail_threshold", 2) or 2)
         self.circuit_open_sec = float(hist.get("circuit_open_sec", 60.0) or 60.0)
+        # WS 通道优先（复用适配器连接，与转发/撤回同一 ID 命名空间，
+        # SnowLuma 下 get_msg 可反查）；关闭则仅用 HTTP 通道
+        self.history_use_ws = bool(hist.get("use_ws", True))
 
         cmd = cfg.get("section_command", {})
         self.enable_status_command = bool(cmd.get("enable_status_command", False))
@@ -667,6 +670,7 @@ class SessionMergerPlugin(BasePlugin):
             cache_ttl_sec=self.cache_ttl_sec,
             circuit_fail_threshold=self.circuit_fail_threshold,
             circuit_open_sec=self.circuit_open_sec,
+            use_ws=self.history_use_ws,
             logger=logger,
         )
 

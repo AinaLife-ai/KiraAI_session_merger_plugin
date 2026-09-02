@@ -1,9 +1,9 @@
 {
   "plugin_id": "kira_session_merger",
   "display_name": "KSM·会话合并与互通",
-  "version": "2.6.3",
+  "version": "2.6.4",
   "author": "znq19",
-  "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。v2.6.3：跨会话路由对齐官方 session_send 的适配器黑白名单检查（allow_list/deny_list），空列表保持兼容放行。",
+  "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。v2.6.4：内置历史工具升级对齐新版 history_plugin v1.3.2——WS 通道优先 + get_msg 刷新媒体源 + 强解析（引用显示 msg_id）+ 空引用占位过滤。",
   "repo": "https://github.com/znq19/KiraAI_session_merger_plugin",
   "core_version": ">=2.29.6",
   "tags": [
@@ -15,5 +15,6 @@
       "display_name": "KSM·会话合并与互通",
       "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。"
     }
-  }
+  },
+  "icon": "icon.png"
 }
