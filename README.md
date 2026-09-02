@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.6.4** · 适用于 KiraAI `core >= 2.29.6`
+**版本 2.6.5** · 适用于 KiraAI `core >= 2.29.6`
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 
@@ -281,6 +281,11 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.6.5
+
+- **修复 WS 通道失效 bug（ctx 未注入）**：v2.6.4 的 `HistoryToolService._get_client` 访问 `self.ctx.adapter_mgr`，但实例化时从未传入 `ctx` → 每次取 WS client 都抛 `'HistoryToolService' object has no attribute 'ctx'`（被 except 吞掉）→ WS 通道从未生效，历史一直走 HTTP 兜底。修复：构造新增 `ctx` 参数，`main.py` 实例化时传入 `ctx=self.ctx`；WS 通道现真正生效（复用适配器连接，与转发/撤回同一 ID 命名空间）
+- `ctx=None` 时优雅降级 HTTP（不崩溃）
 
 ### 2.6.4
 

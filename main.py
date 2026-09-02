@@ -671,6 +671,7 @@ class SessionMergerPlugin(BasePlugin):
             circuit_fail_threshold=self.circuit_fail_threshold,
             circuit_open_sec=self.circuit_open_sec,
             use_ws=self.history_use_ws,
+            ctx=self.ctx,
             logger=logger,
         )
 
