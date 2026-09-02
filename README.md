@@ -282,6 +282,15 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
 
+### 2.6.4
+
+- **内置历史工具升级对齐新版 history_plugin v1.3.2**：
+  - **WS 通道优先**：复用适配器连接拉取历史（与转发/撤回同一 ID 命名空间，SnowLuma 下 get_msg 可反查），HTTP 通道兜底；新增 `use_ws` 开关（默认开）
+  - **强解析**：raw_message 为占位（如 SnowLuma 的 `[引用消息]`）时改用 message 段数组；reply 段显示 `[引用 msg_id:xxx]`（原为 `[回复]`）
+  - **get_msg 批量刷新**：媒体源缺失的消息自动调 get_msg 刷新（最多 10 条/次，SnowLuma 会刷新图片 URL）
+  - **空引用占位过滤**：渲染后判定（内容为空 / 纯占位文本）的消息一律过滤，不再污染 LLM 上下文
+  - 保留 KSM 特有：全局熔断、同回合调用限制、缓存、权限控制、结果截断
+
 ### 2.6.3
 
 - **跨会话路由对齐官方 session_send 黑白名单检查**：KSM 接管 `session_send` 后原版的适配器权限检查（`permission_mode=allow_list` / `deny_list` + `user_list` / `group_list`）被绕过，本版在 `route_cross_session_request` 的目标校正后补回同等检查；空列表视为未配置放行，避免默认配置（allow_list + 空列表）下全部跨会话被拒、破坏老部署

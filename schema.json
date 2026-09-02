@@ -534,6 +534,12 @@
         "default": true,
         "hint": "让 AI 通过 OneBot HTTP 拉取群/好友真实聊天记录。需 OneBot HTTP 服务可用。"
       },
+      "use_ws": {
+        "type": "switch",
+        "name": "WS 通道优先",
+        "default": true,
+        "hint": "优先使用适配器 WS 通道拉取历史（与转发/撤回同一 ID 命名空间，SnowLuma 下 get_msg 可反查并刷新媒体 URL）；关闭则仅用 HTTP 通道。"
+      },
       "disable_history_plugin": {
         "type": "switch",
         "name": "自动关闭 history_plugin",
