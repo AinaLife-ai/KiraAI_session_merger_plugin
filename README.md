@@ -282,6 +282,30 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
 
+### 2.6.6
+
+- **修复 native 多模态模式下因图片文件被清理导致的永久卡死（高风险）**：
+  KiraAI native 模式下，用户发的图片被框架落盘为 `kira_image_ref`（文件引用）。
+  当框架的媒体文件清理机制（`atm CLEANUP` / `cleanup_session_media`）删除旧图片后，
+  合并视图中的老 ref 指向已不存在的文件。这些 ref 进入 provider 侧的
+  `resolve_media_references` 时会抛 `ValueError`，而 `agent_executor.run()`
+  只捕获 `APIStatusError` / `APITimeoutError` / `APIConnectionError` /
+  `ProviderAPIError` 四种异常，`ValueError` 直接穿透导致协程崩溃。
+  崩溃后 `update_memory` 永不调用，KSM `group_agent_queue` 的锁释放钩子
+  （`_wrap_update_memory`）无法触发，组锁永久泄漏（TTL 180s 在无新消息时也不会过期），
+  整个 merge group 从用户视角看就是「发图后 LLM 永远不回回复」。
+  **修复**：`_apply_sync` 合并视图写进请求前，预检每条 `kira_image_ref`
+  的文件存在性。不存在的 ref 替换为 `[Image removed: original cleaned up]`
+  纯文字，不让异常进 provider 层。调试日志 `[MERGER] native media refs: total=%d stale=%d`
+  可观察命中次数。
+- **修复 timeline 对 native 多模态 list content 缺少来源前缀（低风险）**：
+  `to_openai_messages` 中当消息 `content` 为 `list`（含 `kira_image_ref` 的多模态消息）
+  时 `isinstance(content, str)` 为 False，source_tag prefix 不拼接。
+  现在对 list content 的第一个 text 段也正确拼接 `[session: ...]` 前缀。
+- **preprocessor 摘要输入增加图片数量标记（低风险）**：
+  `_msg_text` 在消息含 `kira_image_ref` 时追加 `\n[图片: N 张附件]`，
+  使摘要模型知道被丢弃历史中有图片（native 模式下 text 段仅为 `[Image attached]`）。
+
 ### 2.6.5
 
 - **修复 WS 通道失效 bug（ctx 未注入）**：v2.6.4 的 `HistoryToolService._get_client` 访问 `self.ctx.adapter_mgr`，但实例化时从未传入 `ctx` → 每次取 WS client 都抛 `'HistoryToolService' object has no attribute 'ctx'`（被 except 吞掉）→ WS 通道从未生效，历史一直走 HTTP 兜底。修复：构造新增 `ctx` 参数，`main.py` 实例化时传入 `ctx=self.ctx`；WS 通道现真正生效（复用适配器连接，与转发/撤回同一 ID 命名空间）

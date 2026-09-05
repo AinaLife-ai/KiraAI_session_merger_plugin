@@ -33,6 +33,7 @@ from .summarizer import (
     self_compress_summary,
     summarize_history,
 )
+from core.utils.path_utils import get_data_path
 from .timeline import TimelineBuilder
 
 
@@ -543,6 +544,37 @@ class MergeEngine:
         req.messages.clear()
         req.messages.extend(list(systems) + list(merged))
 
+        # -- precheck native media ref file existence -------------------------
+        # If a kira_image_ref file was cleaned up by the framework,
+        # resolve_media_reference raises ValueError -> agent_executor
+        # does NOT catch it -> coroutine crashes -> update_memory never
+        # called -> KSM group lock leaks -> whole merge group stuck forever.
+        # We precheck here and replace stale refs with plain text.
+        native_total = 0
+        native_stale = 0
+        for msg in req.messages:
+            content = getattr(msg, "content", None)
+            if not isinstance(content, list):
+                continue
+            for i, part in enumerate(content):
+                if isinstance(part, dict) and part.get("type") == "kira_image_ref":
+                    native_total += 1
+                    rel_path = str(part.get("path", "") or "")
+                    if not rel_path:
+                        content[i] = {"type": "text", "text": "[Image removed: empty ref path]"}
+                        native_stale += 1
+                    else:
+                        full = (get_data_path() / rel_path).resolve()
+                        if not full.is_file():
+                            content[i] = {"type": "text", "text": "[Image removed: original cleaned up]"}
+                            native_stale += 1
+
+        if native_total > 0 and self.logger:
+            self.logger.info(
+                "[MERGER] native media refs: total=%d stale=%d replaced sid=%s",
+                native_total, native_stale, sid,
+            )
+
         inject_window_anchor(
             req,
             event,
@@ -551,10 +583,12 @@ class MergeEngine:
         )
 
         self._log(
-            "[MERGER] applied sid=%s msgs=%d elapsed=%.3fs",
+            "[MERGER] applied sid=%s msgs=%d elapsed=%.3fs native_refs=%d(%d stale)",
             sid,
             len(req.messages),
             time.perf_counter() - t0,
+            native_total,
+            native_stale,
         )
         return True
 
