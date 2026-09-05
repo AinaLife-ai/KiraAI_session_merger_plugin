@@ -454,6 +454,22 @@ class TimelineBuilder:
                     )
                     if prefix:
                         content = prefix + content
+            elif isinstance(content, list):
+                # list content (native multimodal) - add source prefix to first text part
+                for i, part in enumerate(content):
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_val = str(part.get("text", "") or "")
+                        if text_val and not (
+                            text_val.startswith("[session:")
+                            or text_val.startswith("[source:")
+                            or text_val.startswith("[source_sid:")
+                        ):
+                            prefix = self._format_source_prefix(
+                                m.source_sid, source_tag_mode, m.role, text_val
+                            )
+                            if prefix:
+                                content[i] = dict(part, text=prefix + text_val)
+                        break
 
             if m.role == "assistant":
                 result.append(

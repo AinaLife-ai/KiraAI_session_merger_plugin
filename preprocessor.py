@@ -46,14 +46,21 @@ def _msg_get(msg: Any, key: str, default: Any = None) -> Any:
 
 
 def _msg_text(content: Any) -> str:
+    """提取消息文本, 含图片时追加附件标记供摘要模型参考."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         parts = []
+        img_count = 0
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
                 parts.append(str(part.get("text", "")))
-        return "".join(parts)
+            elif isinstance(part, dict) and "kira_image" in (part.get("type", "") or ""):
+                img_count += 1
+        text = "".join(parts)
+        if img_count:
+            text += f"\n[图片: {img_count} 张附件]"
+        return text
     if content is None:
         return ""
     return str(content)
