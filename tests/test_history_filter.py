@@ -124,6 +124,29 @@ svc._get_msg_ws = fake_get_msg
 out2 = call(svc, 5)
 check("get_msg refresh now takes effect", "refreshed text" in out2, out2)
 
+# 4) regression: a real forward card / bare reply must NOT be filtered - the
+#    bot needs their message_id to re-forward them.
+FORWARD = {"message_id": 9001, "raw_message": "[CQ:forward,id=res-abc]",
+           "message": [{"type": "forward", "data": {"id": "res-abc"}}],
+           "user_id": 222, "time": 1757300200,
+           "sender": {"user_id": 222, "nickname": "转发者"}}
+BARE_REPLY = {"message_id": 9002, "raw_message": "[CQ:reply,id=123]",
+              "message": [{"type": "reply", "data": {"id": "123"}}],
+              "user_id": 333, "time": 1757300201,
+              "sender": {"user_id": 333, "nickname": "回复者"}}
+REAL_TOKEN = {"message_id": 9003, "raw_message": "&#91;引用消息&#93;",
+              "message": [TEXT("[引用消息]")], "user_id": 444, "time": 1757300202,
+              "sender": {"user_id": 444, "nickname": "真人"}}
+svc2 = HistoryToolService(master_id="", use_ws=False)
+check("forward card kept (not a placeholder)", svc2._is_placeholder(FORWARD) is False)
+check("bare reply kept (not a placeholder)", svc2._is_placeholder(BARE_REPLY) is False)
+check("real user text '[引用消息]' kept", svc2._is_placeholder(REAL_TOKEN) is False)
+check("synthetic placeholder still filtered", svc2._is_placeholder(placeholder(-1)) is True)
+out3 = call(make_service([real_msg(1), FORWARD, placeholder(-2)]), 5)
+check("forward message_id present in history output",
+      "(msg_id:9001)" in out3 and "转发" in out3, out3)
+
+
 print()
 passed = sum(1 for _, ok in results if ok)
 print("TOTAL %d/%d passed" % (passed, len(results)))
