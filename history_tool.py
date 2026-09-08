@@ -18,7 +18,12 @@ from core.chat.message_utils import KiraMessageBatchEvent
 # helper/cq.ts cqEscape). Every placeholder comparison must unescape first,
 # otherwise SnowLuma's "[引用消息]" placeholder arrives as "&#91;引用消息&#93;"
 # and slips through the filter.
-_PLACEHOLDER_TOKENS = {"[引用消息]", "[空消息]", "[引用]", "[转发消息]"}
+#
+# Only the synthetic reply-target placeholder and the empty-message marker are
+# real placeholders. "[引用]" and "[转发消息]" are the *renderings of real
+# segments* (a reply without an id / a forward card) - filtering them would
+# hide the very messages (and their message_id) the bot needs to re-forward.
+_PLACEHOLDER_TOKENS = {"[引用消息]", "[空消息]"}
 _PLACEHOLDER_RAW = _PLACEHOLDER_TOKENS | {""}
 _CQ_ENTITIES = (("&#91;", "["), ("&#93;", "]"), ("&#44;", ","), ("&amp;", "&"))
 
@@ -166,7 +171,11 @@ class HistoryToolService:
                 rid = seg_data.get("id", "")
                 parts.append(f"[引用 msg_id:{rid}]" if rid else "[引用]")
             elif seg_type == "forward":
-                parts.append("[转发消息]")
+                # Keep the forward's resource id: the outer message_id lets the
+                # bot re-forward the card, the res id lets it inspect the
+                # nested content.
+                fid = seg_data.get("id", "")
+                parts.append(f"[转发消息](id={fid})" if fid else "[转发消息]")
             else:
                 parts.append(f"[{seg_type}]")
         return " ".join(parts)
@@ -191,38 +200,34 @@ class HistoryToolService:
         return content
 
     def _is_placeholder(self, msg: dict) -> bool:
-        """True when the message renders as a placeholder (empty quote) and
-        carries no real content - SnowLuma stores reply-conversion failures
-        as such (raw_message = "[引用消息]" with empty/placeholder segments).
-        Filtering these keeps the LLM context clean."""
+        """True only for the synthetic empty-quote rows SnowLuma stores for an
+        unresolvable reply target (and genuinely empty messages).
+
+        A real message - including a forward card or a bare reply - is kept:
+        the bot needs its message_id to re-forward it.
+        """
         raw = cq_unescape((msg.get("raw_message") or "").strip())
         segs = msg.get("message") or []
-        # Placeholder raw_message (non-empty) marks a conversion failure.
-        # raw_message is CQ-escaped, hence the cq_unescape above.
-        if raw and raw in _PLACEHOLDER_RAW:
-            return True
-        # Empty raw_message is normal for segment-based messages - only
-        # filter when there is genuinely no content at all.
+        # Genuinely empty (no raw text and no segments).
         if not raw and not segs:
             return True
-        # Render the content; if it is empty or a pure placeholder after
-        # stripping the trailing (msg_id:xxx), the message is not real.
-        content = self._message_to_text(msg)
-        content = re.sub(r"\s*\(msg_id:-?\d+\)\s*$", "", content).strip()
-        if not content or content in _PLACEHOLDER_TOKENS:
-            return True
-        # Second channel: render from the segment array (already unescaped)
-        # so an escaped placeholder raw_message cannot hide a fake message.
+        # SnowLuma's synthetic reply-target backfill is a single
+        # "[引用消息]" text with user_id 0 (message-actions.ts
+        # buildBackfillEvent). A real user message containing the same text
+        # keeps its real user_id and must be shown.
+        sender = msg.get("sender") if isinstance(msg.get("sender"), dict) else {}
+        uid = str(msg.get("user_id") or sender.get("user_id") or "").strip()
         seg_text = self._segments_to_text(segs).strip() if segs else ""
-        if seg_text and seg_text in _PLACEHOLDER_TOKENS:
+        if uid in ("", "0") and (raw in _PLACEHOLDER_TOKENS
+                                 or seg_text in _PLACEHOLDER_TOKENS):
             return True
-        # SnowLuma's synthetic backfill event: user_id 0 + a single
-        # "[引用消息]" text segment (message-actions.ts buildBackfillEvent).
-        uid = str(msg.get("user_id")
-                  or (msg.get("sender") or {}).get("user_id") or "").strip()
-        if uid in ("", "0") and seg_text in _PLACEHOLDER_TOKENS:
+        # Placeholder raw marker with no segments at all.
+        if raw in _PLACEHOLDER_TOKENS and not segs:
             return True
-        return False
+        # Renders to nothing after stripping the trailing (msg_id:xxx).
+        content = re.sub(r"\s*\(msg_id:-?\d+\)\s*$", "",
+                         self._message_to_text(msg)).strip()
+        return not content
 
     def _needs_refresh(self, msg: dict) -> bool:
         """True when the message needs a get_msg refresh: placeholder
