@@ -282,6 +282,16 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
 
+### 2.6.7
+
+- **修复（根因实锤）**：内置历史工具的占位过滤漏判 CQ 转义。SnowLuma 的 `raw_message`
+  是 CQ 编码串，占位文案 `[引用消息]` 实际以 `&#91;引用消息&#93;` 到达（`helper/cq.ts`
+  的 `cqEscape`），旧判定只比未转义串 → 漏判 → 打印成 `: [引用消息] (msg_id:...)`，
+  并把真实消息挤出窗口。对齐 history_plugin v1.3.3：`cq_unescape()` 归一化 + 双通道
+  判定（raw / 段渲染 / `user_id=0` 合成事件）+ 显示反转义 + `get_msg` 刷新结果不再被丢弃
+  + 过取（`min(80, count×3)`）后再过滤。
+- **新增**：`tests/test_history_filter.py`（8 项断言，含 2026-09-08 日志同形回归）。
+
 ### 2.6.6
 
 - **修复 native 多模态模式下因图片文件被清理导致的永久卡死（高风险）**：
