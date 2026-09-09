@@ -282,6 +282,15 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
 
+### 2.6.9
+
+- **修复**：SnowLuma 合成占位行的另一种形态——`buildBackfillEvent` 的 `user_id` 是
+  **被引用消息的发送者 uin（真实非 0）**，只有 `sender.nickname`/`card` 为空。2.6.8
+  只按 `user_id==0` 判定，所以这类占位仍会以 `: [引用消息] (msg_id:...)` 漏到历史末尾。
+- **修复**：占位判定改为「内容命中占位 token」+「发送者身份为空（`user_id` 为 0/缺失
+  **或** `nickname` 与 `card` 同时为空）」；真实用户消息一律保留。
+- **测试**：`tests/test_history_filter.py` 扩到 15 项。
+
 ### 2.6.8
 
 - **修复（2.6.7 引入的回归）**：`"[转发消息]"` / `"[引用]"` 是**真实段的渲染结果**

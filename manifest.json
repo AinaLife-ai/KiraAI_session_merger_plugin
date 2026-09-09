@@ -1,7 +1,7 @@
 {
   "plugin_id": "kira_session_merger",
   "display_name": "KSM·会话合并与互通",
-  "version": "2.6.8",
+  "version": "2.6.9",
   "author": "znq19",
   "description": "跨会话合并对话上下文，使 AI 真正成为同一个人。v2.6.5：修复内置历史工具 WS 通道 ctx 未注入失效（现真正走适配器 WS 连接），HTTP 兜底保留。",
   "repo": "https://github.com/znq19/KiraAI_session_merger_plugin",
