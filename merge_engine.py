@@ -212,11 +212,34 @@ class MergeEngine:
             self._reset_locks[group_id] = threading.Lock()
         return self._reset_locks[group_id]
 
+    def _host_window(self) -> int:
+        """框架会话窗口（chunk 数）。
+
+        KiraAI v2.34.2 起 `SessionManager.max_memory_length` 实例属性被移除
+        （改为内部按配置现读），继续 getattr 会静默回落到硬编码 10 —— 明明窗口是 50，
+        却按 10 触发合并。这里按版本依次尝试：老属性 → 配置 → 框架自己的取值方法。
+        """
+        manager = self.session_mgr
+        value = getattr(manager, "max_memory_length", None)  # v2.34.1 及更早
+        if value is None:  # v2.34.2+
+            try:
+                value = manager.kira_config["bot_config"]["bot"]["max_memory_length"]
+            except Exception:
+                getter = getattr(manager, "_get_memory_limits", None)
+                try:
+                    value = getter()[0] if callable(getter) else None
+                except Exception:
+                    value = None
+        try:
+            return max(1, int(value or 10))
+        except (TypeError, ValueError):
+            return 10
+
     def _rounds_limit(self) -> int:
-        """rounds 触发的轮数上限：配置优先，0 = 对齐框架 max_memory_length。"""
+        """rounds 触发的轮数上限：配置优先，0 = 对齐框架窗口。"""
         if self.merge_trigger_rounds > 0:
             return self.merge_trigger_rounds
-        return max(1, int(getattr(self.session_mgr, "max_memory_length", 10) or 10))
+        return self._host_window()
 
     def _members_rounds_over(self, members: List[str]) -> bool:
         """任一成员会话磁盘轮数达到框架窗口（rounds 触发，防止框架直接截断丢信息）。"""
