@@ -26,9 +26,24 @@ hx.Timeout = lambda **k: None
 hx.AsyncClient = object
 sys.modules["httpx"] = hx
 
+# history_tool.py uses package-relative imports (from . import locate), so it
+# must be loaded as part of a package to keep working standalone.
+_pkg = "ksm_histpkg"
+_p = types.ModuleType(_pkg)
+_p.__path__ = [ROOT]
+_p.__package__ = _pkg
+sys.modules[_pkg] = _p
+for _sub in ("locate", "onebot_compat"):
+    _s = importlib.util.spec_from_file_location(
+        f"{_pkg}.{_sub}", os.path.join(ROOT, f"{_sub}.py"))
+    _m = importlib.util.module_from_spec(_s)
+    sys.modules[f"{_pkg}.{_sub}"] = _m
+    _s.loader.exec_module(_m)
+
 spec = importlib.util.spec_from_file_location(
-    "history_tool", os.path.join(ROOT, "history_tool.py"))
+    f"{_pkg}.history_tool", os.path.join(ROOT, "history_tool.py"))
 mod = importlib.util.module_from_spec(spec)
+sys.modules[f"{_pkg}.history_tool"] = mod
 spec.loader.exec_module(mod)
 HistoryToolService = mod.HistoryToolService
 
@@ -93,7 +108,7 @@ out = call(make_service(msgs), 10)
 lines = [l for l in out.splitlines() if l.strip()]
 check("escaped placeholder rows filtered", all("引用消息" not in l for l in lines), lines)
 check("over-fetch still returns 10 real messages", len(lines) == 10, len(lines))
-check("newest real message kept", lines[-1].startswith("U18:"), lines[-1])
+check("newest real message kept", lines[-1].startswith("U18(118):"), lines[-1])
 check("CQ entities unescaped for display",
       "看[x]" in out and "&#91;" not in out, out.splitlines()[0])
 
