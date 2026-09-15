@@ -427,6 +427,32 @@ class SessionMergerPlugin(BasePlugin):
         # SnowLuma 下 get_msg 可反查）；关闭则仅用 HTTP 通道
         self.history_use_ws = bool(hist.get("use_ws", True))
 
+        # 定位（时间/用户/关键词）配置：全部带默认值，不配置即保持旧行为
+        self.locate_cfg = {
+            "enable_locate": bool(hist.get("enable_locate", True)),
+            "enable_keyword": bool(hist.get("enable_keyword", True)),
+            "enable_time_range": bool(hist.get("enable_time_range", True)),
+            "enable_user_filter": bool(hist.get("enable_user_filter", True)),
+            "default_scan_limit": int(hist.get("default_scan_limit", 300) or 300),
+            "max_scan_limit": int(hist.get("max_scan_limit", 0) or 0),
+            "scan_max_seconds": float(hist.get("scan_max_seconds", 25) or 25),
+            "max_fetch_per_request": int(hist.get("max_fetch_per_request", 50) or 50),
+            "fetch_timeout_sec": float(hist.get("fetch_timeout_sec", 15) or 15),
+            "max_scanned_per_turn": int(hist.get("max_scanned_per_turn", 3000) or 3000),
+            "early_stop_on_enough": bool(hist.get("early_stop_on_enough", True)),
+            "detect_boundary": bool(hist.get("detect_boundary", True)),
+            "keyword_case_sensitive": bool(hist.get("keyword_case_sensitive", False)),
+            "max_keywords": int(hist.get("max_keywords", 5) or 5),
+            "offset_max": int(hist.get("offset_max", 1000) or 1000),
+            "max_return_count": int(hist.get("max_return_count", 80) or 80),
+            "locate_fallback_on_error": bool(hist.get("locate_fallback_on_error", True)),
+            "locate_head_meta": bool(hist.get("locate_head_meta", True)),
+            "locate_cache_ttl_sec": int(hist.get("locate_cache_ttl_sec", 120) or 120),
+            "max_calls_per_turn": int(hist.get("max_calls_per_turn", 3) or 3),
+            "max_calls_per_target_per_turn": int(
+                hist.get("max_calls_per_target_per_turn", 2) or 2),
+        }
+
         cmd = cfg.get("section_command", {})
         self.enable_status_command = bool(cmd.get("enable_status_command", False))
         sc = cmd.get("status_commands", cmd.get("status_command", ["/merge s", "/合并状态"]))
@@ -673,6 +699,7 @@ class SessionMergerPlugin(BasePlugin):
             use_ws=self.history_use_ws,
             ctx=self.ctx,
             logger=logger,
+            locate_cfg=self.locate_cfg,
         )
 
     async def initialize(self):
@@ -1773,7 +1800,10 @@ class SessionMergerPlugin(BasePlugin):
                 "- 目标就是当前会话 → 直接输出 xml / 在本会话调工具\n"
                 "### get_session_history\n"
                 "- 近期合并上下文已注入；需要更早平台真历史时再查；"
-                "同一目标每回合最多 1 次；Rejected 后停止再查\n"
+                "同一目标每回合最多 2 次；Rejected 后停止再查\n"
+                "- 可用 since/until/user_id/keyword 定位（从最新往回扫再过滤）；"
+                "返回头有「命中/扫描/覆盖/到最早」，未命中只能说"
+                "「在扫描范围内未找到」\n"
             )
             for p in req.system_prompt or []:
                 if getattr(p, "name", None) == "tools":
@@ -1949,9 +1979,16 @@ class SessionMergerPlugin(BasePlugin):
     @register.tool(
         name="get_session_history",
         description=(
-            "通过 OneBot HTTP 拉取群/私聊平台真历史（含更早记录、msg_id、图片 URL）。"
-            "合并模式下近期上下文已注入：仅当需要更早/平台侧记录时再查；"
-            "同一目标每回合最多成功查 1 次，返回 Rejected/Error 后禁止再调。"
+            "通过 OneBot 拉取群/私聊平台真历史（含更早记录、msg_id、图片 URL）。\n"
+            "两种用法：\n"
+            "1) 最近消息（默认）：不传任何定位参数，返回最近 count 条。\n"
+            "2) 定位：传 since / until / user_id / keyword 中的任意一个，按条件查找。\n"
+            "定位是从最新消息向更早翻页再本地过滤，返回头会给出「命中/扫描/覆盖/到最早」，"
+            "据此判断是否值得继续扫。它是「倒带」不是「搜索索引」：最近几百到几千条很快，"
+            "很久以前的消息可能够不着。\n"
+            "没找到时只能说「在扫描范围内未命中」，绝不能说「群里没人说过」。\n"
+            "合并模式下近期上下文已注入：仅在需要更早/平台侧记录时再查；"
+            "同一目标每回合最多 2 次，返回 Rejected/Error 后禁止再调。\n"
             "session_id 从会话列表原样复制（adapter:gm:群号 / adapter:dm:对方号）。"
         ),
         params={
@@ -1964,11 +2001,36 @@ class SessionMergerPlugin(BasePlugin):
                 "count": {
                     "type": "integer",
                     "default": 20,
-                    "description": "消息数量，建议 20-50，最少 5，最多 80",
+                    "description": "返回消息数量，建议 20-50，最少 5，最多 80",
                 },
                 "session_type": {
                     "type": "string",
                     "description": "可选：group/private/gm/dm；session_id 为纯数字时使用",
+                },
+                "since": {
+                    "type": "string",
+                    "description": "只返回此时间之后的消息。格式：2026-09-15 09:10 / 09-15 09:10 / 09:10 / 2026-09-15",
+                },
+                "until": {
+                    "type": "string",
+                    "description": "只返回此时间之前的消息，格式同 since",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "只看这个人发的消息。填 QQ 号（多个逗号分隔），也可填群名片/昵称的一部分",
+                },
+                "keyword": {
+                    "type": "string",
+                    "description": "只看包含该关键词的消息（多个用空格或逗号分隔，任一命中即可）",
+                },
+                "offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "跳过前 N 条命中结果，用于翻页查看后续命中",
+                },
+                "scan_limit": {
+                    "type": "integer",
+                    "description": "最多往回扫描多少条消息（默认 300）。命中不够时可加大，耗时随之增加",
                 },
             },
             "required": ["session_id"],
@@ -1980,6 +2042,12 @@ class SessionMergerPlugin(BasePlugin):
         session_id: str,
         count: int = 20,
         session_type: str = "",
+        since: str = None,
+        until: str = None,
+        user_id: str = None,
+        keyword: str = None,
+        offset: int = 0,
+        scan_limit: int = None,
         **_,
     ) -> str:
         if not self.enable_history_tool:
@@ -1992,6 +2060,12 @@ class SessionMergerPlugin(BasePlugin):
             count=count,
             session_type=session_type or None,
             merge_enabled=bool(self.enabled),
+            since=since,
+            until=until,
+            user_id=user_id,
+            keyword=keyword,
+            offset=offset,
+            scan_limit=scan_limit,
         )
 
     @on.after_xml_parse(priority=Priority.HIGH)

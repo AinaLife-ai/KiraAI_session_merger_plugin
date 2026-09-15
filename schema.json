@@ -532,7 +532,7 @@
         "type": "switch",
         "name": "启用历史查询工具",
         "default": true,
-        "hint": "让 AI 通过 OneBot HTTP 拉取群/好友真实聊天记录。需 OneBot HTTP 服务可用。"
+        "hint": "让 AI 拉取群/好友真实聊天记录。需 OneBot HTTP 或适配器 WS 可用。支持两种用法：只给条数=取最近 N 条；给 since/until/user_id/keyword=按条件定位查找。"
       },
       "use_ws": {
         "type": "switch",
@@ -550,7 +550,7 @@
         "type": "string",
         "name": "OneBot HTTP 地址",
         "default": "localhost",
-        "hint": "OneBot/NapCat 等提供的 HTTP 主机名或 IP。"
+        "hint": "OneBot/NapCat 等提供的 HTTP 主机名或 IP。注意：定位查询优先复用适配器 WS 通道（无需配置本项）；HTTP 仅作兜底。"
       },
       "http_port": {
         "type": "integer",
@@ -607,6 +607,156 @@
         "minimum": 5,
         "maximum": 600,
         "hint": "熔断后多少秒内直接拒绝历史查询，避免拖慢 agent。"
+      },
+      "enable_locate": {
+        "type": "switch",
+        "name": "启用定位查询（时间/用户/关键词）",
+        "default": true,
+        "hint": "开启后 get_session_history 支持 since/until/user_id/keyword/offset/scan_limit，从最新消息往回翻页并按条件过滤。关闭则完全等同旧版（只按条数取最近）。"
+      },
+      "enable_time_range": {
+        "type": "switch",
+        "name": "允许时间过滤",
+        "default": true,
+        "hint": "允许 since/until 参数。关闭后模型传时间也不生效（其它定位维度不受影响）。"
+      },
+      "enable_user_filter": {
+        "type": "switch",
+        "name": "允许用户过滤",
+        "default": true,
+        "hint": "允许 user_id 参数（同时匹配 QQ 号、群名片、昵称）。"
+      },
+      "enable_keyword": {
+        "type": "switch",
+        "name": "允许关键词过滤",
+        "default": true,
+        "hint": "允许 keyword 参数。若担心模型乱搜可只关这一项。"
+      },
+      "locate_head_meta": {
+        "type": "switch",
+        "name": "返回扫描元信息头",
+        "default": true,
+        "hint": "在结果最前面加上「命中/扫描/覆盖/到最早/耗时」。强烈建议保持开启：没有它，模型会把「没扫到」说成「群里没人说过」。"
+      },
+      "locate_fallback_on_error": {
+        "type": "switch",
+        "name": "翻页失败自动重试",
+        "default": true,
+        "hint": "翻页途中锚点失效（NapCat/LLOneBot 的短 ID 缓存会淘汰旧 ID）时，自动丢掉锚点从最新一页重新定位一次。"
+      },
+      "keyword_case_sensitive": {
+        "type": "switch",
+        "name": "关键词区分大小写",
+        "default": false,
+        "hint": "默认不区分大小写。"
+      },
+      "early_stop_on_enough": {
+        "type": "switch",
+        "name": "命中足够即停止扫描",
+        "default": true,
+        "hint": "不带 since 时间下界时，命中数达标就停（更快）。关闭会更全但更慢；带 since 时始终扫到时间边界为止，不受此项影响。"
+      },
+      "detect_boundary": {
+        "type": "switch",
+        "name": "检测「已到会话最早」",
+        "default": true,
+        "hint": "识别已经扫到历史尽头，提前停止并在结果头标注「到最早=是」。"
+      },
+      "scan_max_seconds": {
+        "type": "integer",
+        "name": "单次扫描时间上限（秒）",
+        "default": 25,
+        "minimum": 5,
+        "maximum": 55,
+        "hint": "一次定位最多扫多久。框架单次工具调用超时默认 60 秒，这里留足余量；到点会带着已扫到的结果返回。"
+      },
+      "max_fetch_per_request": {
+        "type": "integer",
+        "name": "单页抓取条数",
+        "default": 50,
+        "minimum": 5,
+        "maximum": 200,
+        "hint": "每次向 OneBot 请求多少条。调小更稳（SnowLuma 有 300ms 节流），调大更快。会被各实现自身的单次上限自动压低（LLOneBot ≤30，SnowLuma ≤200）。"
+      },
+      "fetch_timeout_sec": {
+        "type": "integer",
+        "name": "单页请求超时（秒）",
+        "default": 15,
+        "minimum": 3,
+        "maximum": 60,
+        "hint": "单次 OneBot 历史请求的超时时间。"
+      },
+      "max_scanned_per_turn": {
+        "type": "integer",
+        "name": "每回合扫描总量上限（条）",
+        "default": 3000,
+        "minimum": 0,
+        "maximum": 20000,
+        "hint": "同一回合内所有定位调用累加的扫描条数上限，防止连续调用把服务器打爆。0 表示不限制（不建议）。"
+      },
+      "max_keywords": {
+        "type": "integer",
+        "name": "关键词数量上限",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 20,
+        "hint": "单次最多接受几个关键词，超出按顺序截断。"
+      },
+      "offset_max": {
+        "type": "integer",
+        "name": "offset 上限",
+        "default": 1000,
+        "minimum": 0,
+        "maximum": 100000,
+        "hint": "单次 offset 的最大值，防止模型从很靠后的位置「找」结果。"
+      },
+      "max_return_count": {
+        "type": "integer",
+        "name": "单次返回条数上限",
+        "default": 80,
+        "minimum": 5,
+        "maximum": 200,
+        "hint": "count 参数的上限（与旧版 80 保持一致）。"
+      },
+      "default_scan_limit": {
+        "type": "integer",
+        "name": "默认扫描条数",
+        "default": 300,
+        "minimum": 20,
+        "maximum": 1000,
+        "hint": "模型不传 scan_limit 时往回想扫多少条。300 约等于中群一天、大群十几分钟；命中不够时模型可自行加大。"
+      },
+      "max_scan_limit": {
+        "type": "integer",
+        "name": "扫描条数硬上限",
+        "default": 0,
+        "minimum": 0,
+        "maximum": 5000,
+        "hint": "模型传入 scan_limit 的上限。0 = 按协议实现自适应（NapCat 2000 / LLOneBot 1200 / SnowLuma 800）。"
+      },
+      "locate_cache_ttl_sec": {
+        "type": "integer",
+        "name": "定位结果缓存（秒）",
+        "default": 120,
+        "minimum": 0,
+        "maximum": 3600,
+        "hint": "完全相同的定位条件在此时长内直接返回缓存，避免重复扫描。"
+      },
+      "max_calls_per_turn": {
+        "type": "integer",
+        "name": "每回合历史查询次数上限",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 10,
+        "hint": "同一回合内允许调用 get_session_history 的总次数。定位需要多轮尝试（换条件/翻页），故比旧版（2 次）略高。"
+      },
+      "max_calls_per_target_per_turn": {
+        "type": "integer",
+        "name": "每回合同一会话查询上限",
+        "default": 2,
+        "minimum": 1,
+        "maximum": 10,
+        "hint": "同一会话在同一回合内最多查几次。旧版为 1（定位无法翻页），现默认 2；条件不同的多轮定位据此放行，重复条件仍会被拦截。"
       }
     }
   },

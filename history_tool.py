@@ -3,11 +3,15 @@ from __future__ import annotations
 import re
 import time
 import traceback
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 from core.chat.message_utils import KiraMessageBatchEvent
+
+from . import locate
+from .onebot_compat import build_payload, resolve_impl
 
 
 # Placeholder raw_message produced by some OneBot implementations (e.g.
@@ -62,11 +66,17 @@ class HistoryToolService:
     READ_TIMEOUT = 15.0
     ERROR_CACHE_TTL = 90.0
     # 同一 agent 回合内：同一目标会话最多成功返回几次（再调用直接拒绝，不塞大段历史）
-    MAX_CALLS_PER_TARGET_PER_EVENT = 1
+    MAX_CALLS_PER_TARGET_PER_EVENT = 2
     # 同一 agent 回合内：历史工具总调用上限（含被拒绝的）
-    MAX_CALLS_PER_EVENT = 2
+    MAX_CALLS_PER_EVENT = 3
     # 单次返回正文最大字符，避免 tool_result 把上下文撑爆
     MAX_RESULT_CHARS = 3500
+    # 单次调用内最多翻多少页（硬兜底，防止实现异常导致死循环）
+    MAX_SCAN_STEPS = 80
+    # 「涉及」行最多列出几个不同的人（每条约 15-25 字符，与正文共享 3500 字预算）
+    MAX_PEOPLE_SHOWN = 5
+    # 旧路径的超取下限：至少请求这么多条，避免占位行挤掉真实消息
+    FETCH_CEILING = 80
 
     def __init__(
         self,
@@ -82,6 +92,7 @@ class HistoryToolService:
         use_ws: bool = True,
         ctx=None,
         logger=None,
+        locate_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.http_host = http_host or "localhost"
         self.http_port = int(http_port or 3000)
@@ -102,6 +113,38 @@ class HistoryToolService:
         self._fail_streak = 0
         self._circuit_open_until = 0.0
 
+        # ---------- locate (time / user / keyword) ----------
+        locate_cfg = locate_cfg or {}
+        self.enable_locate = bool(locate_cfg.get("enable_locate", True))
+        self.enable_keyword = bool(locate_cfg.get("enable_keyword", True))
+        self.enable_time_range = bool(locate_cfg.get("enable_time_range", True))
+        self.enable_user_filter = bool(locate_cfg.get("enable_user_filter", True))
+        self.default_scan_limit = max(1, int(locate_cfg.get("default_scan_limit", 300) or 300))
+        self.max_scan_limit = max(0, int(locate_cfg.get("max_scan_limit", 0) or 0))
+        self.scan_max_seconds = max(1.0, float(locate_cfg.get("scan_max_seconds", 25) or 25))
+        self.max_fetch_per_request = max(1, int(locate_cfg.get("max_fetch_per_request", 50) or 50))
+        self.fetch_timeout_sec = max(1.0, float(locate_cfg.get("fetch_timeout_sec", 15) or 15))
+        self.max_scanned_per_turn = max(0, int(locate_cfg.get("max_scanned_per_turn", 3000) or 3000))
+        # 调用次数预算（可配置；类常量仅作为默认值）
+        self.max_calls_per_turn = max(
+            1, int(locate_cfg.get("max_calls_per_turn", self.MAX_CALLS_PER_EVENT)
+                   or self.MAX_CALLS_PER_EVENT))
+        self.max_calls_per_target_per_turn = max(
+            1, int(locate_cfg.get("max_calls_per_target_per_turn",
+                                  self.MAX_CALLS_PER_TARGET_PER_EVENT)
+                   or self.MAX_CALLS_PER_TARGET_PER_EVENT))
+        self.early_stop_on_enough = bool(locate_cfg.get("early_stop_on_enough", True))
+        self.detect_boundary = bool(locate_cfg.get("detect_boundary", True))
+        self.keyword_case_sensitive = bool(locate_cfg.get("keyword_case_sensitive", False))
+        self.max_keywords = max(1, int(locate_cfg.get("max_keywords", 5) or 5))
+        self.offset_max = max(0, int(locate_cfg.get("offset_max", 1000) or 1000))
+        self.max_return_count = max(1, int(locate_cfg.get("max_return_count", 80) or 80))
+        self.locate_fallback_on_error = bool(locate_cfg.get("locate_fallback_on_error", True))
+        self.locate_head_meta = bool(locate_cfg.get("locate_head_meta", True))
+        self.locate_cache_ttl_sec = max(0, int(locate_cfg.get("locate_cache_ttl_sec", 120) or 120))
+        self._locate_cache: Dict[str, Dict[str, Any]] = {}
+        self._impl_cache: Dict[str, Dict[str, Any]] = {}
+
     def _check_permission(self, user_id: str, session_type: str, session_id: str) -> bool:
         if not self.master_id:
             return True
@@ -117,21 +160,41 @@ class HistoryToolService:
             return session_id not in self.restricted_groups
         return False
 
-    @staticmethod
-    def parse_session_ref(session_id: str, session_type: Optional[str] = None) -> Dict[str, str]:
+    # Session-type tokens that may appear in the middle position. A 2-part ref
+    # like "gm:123" is ambiguous (adapter:entity? or type:entity?), so we
+    # resolve it by checking this set rather than assuming it is adapter:id.
+    _TYPE_TOKENS = {
+        "gm": "gm", "group": "gm", "g": "gm",
+        "dm": "dm", "private": "dm", "p": "dm", "friend": "dm",
+    }
+
+    @classmethod
+    def parse_session_ref(cls, session_id: str, session_type: Optional[str] = None) -> Dict[str, str]:
         sid = (session_id or "").strip()
         st = (session_type or "").strip().lower()
 
         if ":" in sid:
-            parts = sid.split(":", 2)
-            adapter = parts[0] if len(parts) >= 1 else "qq"
-            typ = parts[1] if len(parts) >= 2 else "dm"
-            entity = parts[2] if len(parts) >= 3 else sid
+            parts = sid.split(":")
+            if len(parts) >= 3:
+                adapter = parts[0] or "qq"
+                typ = parts[1] or "dm"
+                entity = ":".join(parts[2:])
+            elif len(parts) == 2:
+                head, tail = parts[0].strip(), parts[1].strip()
+                if head.lower() in cls._TYPE_TOKENS:
+                    # "gm:123" -> type + entity (no adapter segment)
+                    adapter, typ, entity = "qq", head.lower(), tail
+                else:
+                    # "qq:123" -> adapter + entity, type unknown
+                    adapter, typ, entity = head or "qq", "dm", tail
+            else:  # len == 1 (a bare leading ':')
+                adapter, typ, entity = "qq", "dm", sid
             if typ in ("group", "g"):
                 typ = "gm"
             if typ in ("private", "p", "friend"):
                 typ = "dm"
-            return {"adapter": adapter, "session_type": typ, "session_id": entity, "full": sid}
+            return {"adapter": adapter, "session_type": typ,
+                    "session_id": entity, "full": sid}
 
         if st in ("group", "gm", "g"):
             typ = "gm"
@@ -142,6 +205,124 @@ class HistoryToolService:
         return {"adapter": "qq", "session_type": typ, "session_id": sid, "full": f"qq:{typ}:{sid}"}
 
     # ---------- 强解析（对齐 history_plugin v1.3.2） ----------
+
+    # ---------- locate: 实现探测 / 分页 ----------
+
+    async def _resolve_impl(self, client, adapter_name: str) -> Dict[str, Any]:
+        """Probe the OneBot implementation once per adapter (see onebot_compat).
+
+        NapCat / LLOneBot / SnowLuma disagree on the anchor parameter, so the
+        scanner needs to know which one it is talking to. Failure falls back to
+        the generic knob set (no anchor) - degraded, never broken.
+        """
+        cached = self._impl_cache.get(adapter_name)
+        if cached is not None:
+            return cached
+        impl = resolve_impl("")
+        if client is not None:
+            try:
+                resp = await client.send_action("get_version_info", {}, timeout=8)
+                data = (resp or {}).get("data") or {}
+                app_name = str(data.get("app_name") or "")
+                if app_name:
+                    impl = resolve_impl(app_name)
+                    if self.logger:
+                        self.logger.info(
+                            "[history_tool] OneBot impl=%s anchor=%s",
+                            app_name, impl.get("anchor_param"))
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(
+                        "[history_tool] get_version_info failed, generic knobs: %s", e)
+        if self.max_scan_limit > 0:
+            impl["max_scan_limit"] = self.max_scan_limit
+        impl["max_page"] = max(1, min(int(impl.get("max_page") or 30),
+                                      self.max_fetch_per_request))
+        self._impl_cache[adapter_name] = impl
+        return impl
+
+    async def _fetch_page_ws(self, client, session_type: str, session_id: str,
+                             impl: Dict[str, Any], anchor, count: int):
+        """One page via the adapter WS channel (oldest->newest)."""
+        if session_type == "gm":
+            action, base = "get_group_msg_history", {"group_id": str(session_id)}
+        else:
+            action, base = "get_friend_msg_history", {"user_id": str(session_id)}
+        payload = build_payload(impl, base, anchor, count)
+        try:
+            resp = await client.send_action(action, payload, timeout=self.fetch_timeout_sec)
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[history_tool] WS page failed: {e}")
+            return None
+        if not isinstance(resp, dict) or resp.get("status") != "ok":
+            return None
+        messages = (resp.get("data") or {}).get("messages") or []
+        return messages if isinstance(messages, list) else None
+
+    async def _fetch_page_http(self, session_type: str, session_id: str,
+                               impl: Dict[str, Any], anchor, count: int):
+        """One page via the HTTP service, same payload shape as the WS path."""
+        if session_type == "gm":
+            api, base = "get_group_msg_history", {"group_id": str(session_id)}
+        else:
+            api, base = "get_friend_msg_history", {"user_id": str(session_id)}
+        payload = build_payload(impl, base, anchor, count)
+        headers = {}
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+        timeout = httpx.Timeout(
+            connect=self.CONNECT_TIMEOUT,
+            read=self.READ_TIMEOUT,
+            write=self.READ_TIMEOUT,
+            pool=self.CONNECT_TIMEOUT,
+        )
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(f"{self.base_url}/{api}", json=payload,
+                                         headers=headers)
+                if resp.status_code >= 400:
+                    return None
+                result = resp.json()
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"[history_tool] HTTP page failed: {e}")
+            return None
+        if not isinstance(result, dict) or result.get("status") != "ok":
+            return None
+        messages = (result.get("data") or {}).get("messages") or []
+        return messages if isinstance(messages, list) else None
+
+    def _make_page_fetcher(self, client, session_type: str, session_id: str,
+                           impl: Dict[str, Any]):
+        """fetch_page(anchor, count) for the scanner.
+
+        A WS failure on the FIRST page falls back to HTTP for the whole walk;
+        a failure later on is raised so the caller can retry from the newest
+        page (a mid-walk transport switch would repeat everything anyway).
+        """
+        state = {"fell_back": False}
+
+        async def fetch_page(anchor, count):
+            if client is not None and not state["fell_back"]:
+                page = await self._fetch_page_ws(client, session_type, session_id,
+                                                 impl, anchor, count)
+                if page is not None:
+                    return page
+                if anchor is None:
+                    state["fell_back"] = True
+                    if self.logger:
+                        self.logger.warning(
+                            "[history_tool] WS page failed, falling back to HTTP")
+                else:
+                    raise RuntimeError("WS 翻页失败")
+            page = await self._fetch_page_http(session_type, session_id, impl,
+                                               anchor, count)
+            if page is None:
+                raise RuntimeError("HTTP 翻页失败")
+            return page
+
+        return fetch_page
 
     @staticmethod
     def _segments_to_text(msg_segments) -> str:
@@ -389,18 +570,25 @@ class HistoryToolService:
         )
 
     @staticmethod
-    def _event_extra(event) -> dict:
+    def _event_extra(event):
+        """Return the per-event scratch dict, or None when the event refuses it.
+
+        An EMPTY dict is a normal state and must be returned as-is: several
+        callers create keys on it. Returning {} here used to make the scan
+        budget unchargeable.
+        """
         try:
             extra = getattr(event, "extra", None)
-            if not isinstance(extra, dict):
-                extra = {}
-                try:
-                    event.extra = extra
-                except Exception:
-                    return {}
+            if isinstance(extra, dict):
+                return extra
+            extra = {}
+            try:
+                event.extra = extra
+            except Exception:
+                return None
             return extra
         except Exception:
-            return {}
+            return None
 
     def _track_and_limit(self, event, target_key: str) -> Optional[str]:
         """
@@ -408,19 +596,21 @@ class HistoryToolService:
         返回非 None 则应直接 return 该字符串，不再打 HTTP。
         """
         extra = self._event_extra(event)
+        if extra is None:
+            return None
         total = int(extra.get("merger_hist_total", 0) or 0)
         by_target = extra.get("merger_hist_by_target")
         if not isinstance(by_target, dict):
             by_target = {}
             extra["merger_hist_by_target"] = by_target
 
-        if total >= self.MAX_CALLS_PER_EVENT:
+        if total >= self.max_calls_per_turn:
             return (
                 "Rejected: 本回合 get_session_history 调用次数已达上限。"
                 "请直接回复，禁止再查历史。"
             )
         n = int(by_target.get(target_key, 0) or 0)
-        if n >= self.MAX_CALLS_PER_TARGET_PER_EVENT:
+        if n >= self.max_calls_per_target_per_turn:
             return (
                 f"Rejected: 本回合已查询过 {target_key} 的历史。"
                 "请直接基于上下文回复，禁止再次 get_session_history。"
@@ -440,16 +630,20 @@ class HistoryToolService:
     def _note_failure(self):
         """记录失败并进入熔断。
 
-        关键修复：熔断窗口期内再次失败时，不再把窗口重新续到未来
-        （否则会像「永远打不开」）。窗口结束后 _fail_streak 重置。
+        窗口期内再次失败时不再把窗口续到未来（否则会像「永远打不开」）。
+
+        注意 `_circuit_open_until == 0` 表示「熔断从未打开」：此时
+        `now >= 0` 恒为真，若照旧重置计数，`_fail_streak` 会永远停在 1，
+        永远达不到阈值 —— 熔断实际从未生效。只有在窗口**真的开过又结束**
+        （`0 < open_until <= now`）时才重置计数。
         """
         now = time.time()
-        if now >= self._circuit_open_until:
-            # 窗口已结束，说明这是一次新的失败序列，重置计数
+        if 0 < self._circuit_open_until <= now:
+            # 窗口刚刚结束：这是一段新的失败序列，从零开始计
             self._fail_streak = 0
+            self._circuit_open_until = 0.0
         self._fail_streak += 1
         if self._fail_streak >= self.circuit_fail_threshold:
-            # 只在首次进入熔断时设置窗口；窗口期内不再延长
             if now >= self._circuit_open_until:
                 self._circuit_open_until = now + self.circuit_open_sec
                 if self.logger:
@@ -481,35 +675,53 @@ class HistoryToolService:
         session_type: Optional[str] = None,
         *,
         merge_enabled: bool = False,
+        since: Optional[str] = None,
+        until: Optional[str] = None,
+        user_id: Optional[str] = None,
+        keyword: Optional[str] = None,
+        offset: int = 0,
+        scan_limit: Optional[int] = None,
     ) -> str:
         try:
             blocked = self._circuit_blocked()
             if blocked:
                 return blocked
 
-            user_id = "unknown"
+            caller_id = "unknown"
             if event.messages and event.messages[0].sender:
-                user_id = str(event.messages[0].sender.user_id)
+                caller_id = str(event.messages[0].sender.user_id)
 
             ref = self.parse_session_ref(session_id, session_type)
             st = ref["session_type"]
             entity = ref["session_id"]
 
-            if not self._check_permission(user_id, st, entity):
+            if not self._check_permission(caller_id, st, entity):
                 return "抱歉，您没有权限查看此会话的历史消息。"
 
+            # Models routinely send numbers as strings ("20") or as floats;
+            # coerce before comparing, otherwise `count < 5` raises TypeError
+            # and the tool call dies instead of returning anything.
             try:
-                count = int(count)
-            except Exception:
+                count = int(float(count))
+            except (TypeError, ValueError):
                 count = 20
-            # 与 history_plugin 对齐：最少 5，最多 80，默认 20
+            # 与 history_plugin 对齐：最少 5，最多 max_return_count
             if count < 5:
                 count = 5
-            elif count > 80:
-                count = 80
+            elif count > self.max_return_count:
+                count = self.max_return_count
 
             cache_key = f"{st}:{entity}"
             target_key = cache_key
+
+            wants_locate = self.enable_locate and any(
+                arg not in (None, "", 0)
+                for arg in (since, until, user_id, keyword, offset, scan_limit)
+            )
+            if wants_locate:
+                return await self._locate_session_history(
+                    event, st, entity, count, since, until, user_id, keyword,
+                    offset, scan_limit, target_key)
 
             # 本回合调用次数硬限制（在缓存命中之前也计数，防止刷拒绝）
             limited = self._track_and_limit(event, target_key)
@@ -522,8 +734,12 @@ class HistoryToolService:
 
             # ---------- 拉取历史：WS 通道优先，HTTP 兜底 ----------
             # Over-fetch so placeholder rows (which sit at the newest end)
-            # cannot crowd real messages out of the returned window.
-            fetch_count = min(80, max(count, count * 3))
+            # cannot crowd real messages out of the window. The ceiling follows
+            # `count` but never below FETCH_CEILING, so raising `count` (up to
+            # max_return_count) actually fetches enough instead of silently
+            # capping at 80.
+            fetch_count = min(max(count, self.FETCH_CEILING),
+                              max(count, count * 3))
             messages = None
             err = None
             client = None
@@ -583,9 +799,7 @@ class HistoryToolService:
                     continue
                 real.append(msg)
             for msg in real[-count:]:
-                sender = msg.get("sender", {}).get("nickname", "Unknown")
-                content = self._message_to_text(msg)
-                formatted.append(f"{sender}: {content}")
+                formatted.append(self._format_line(msg))
 
             if skipped and self.logger:
                 self.logger.info(
@@ -625,3 +839,335 @@ class HistoryToolService:
                 pass
             self._note_failure()
             return err
+
+    # ---------- locate path: scan backwards + filter ----------
+
+    def _format_line(self, msg: dict) -> str:
+        """`昵称(QQ): 内容`.
+
+        The QQ number is not decoration: nickname and group card both change,
+        and in a group the two can differ from each other. Without a stable id
+        the model cannot tell that two names refer to the same person.
+        """
+        label = locate.person_of(msg).sender_label()
+        content = self._message_to_text(msg)
+        return f"{label}: {content}"
+
+    def _scan_limit_cap(self) -> int:
+        caps = [impl.get("max_scan_limit") for impl in self._impl_cache.values()]
+        caps = [int(c) for c in caps if c]
+        cap = min(caps) if caps else (self.max_scan_limit or 600)
+        if self.max_scan_limit:
+            cap = min(cap, self.max_scan_limit)
+        return max(1, cap)
+
+    def _build_locale_query(self, since, until, user_id, keyword, offset, scan_limit):
+        """Parse raw tool args into (query, notes, error)."""
+        now = datetime.now()
+        query = locate.LocateQuery()
+        notes: List[str] = []
+
+        if self.enable_time_range:
+            ts, err = locate.parse_time_arg(since, now)
+            if err:
+                return None, notes, err
+            query.since = ts
+            ts, err = locate.parse_time_arg(until, now)
+            if err:
+                return None, notes, err
+            query.until = ts
+        elif since or until:
+            notes.append("时间过滤已在配置中关闭（enable_time_range）")
+
+        if self.enable_user_filter and user_id:
+            query.user_ids, query.user_names = locate.normalize_user(user_id)
+        elif user_id:
+            notes.append("用户过滤已在配置中关闭（enable_user_filter）")
+
+        if self.enable_keyword and keyword:
+            words, warn = locate.normalize_keywords(keyword, self.max_keywords)
+            query.keywords = words
+            if warn:
+                notes.append(warn)
+        elif keyword:
+            notes.append("关键词过滤已在配置中关闭（enable_keyword）")
+
+        if not (query.since or query.until or query.user_ids or query.user_names
+                or query.keywords):
+            notes.append("定位参数均无效，本次按最近消息返回")
+
+        try:
+            query.offset = max(0, int(offset or 0))
+        except (TypeError, ValueError):
+            query.offset = 0
+        if self.offset_max and query.offset > self.offset_max:
+            notes.append(f"offset 超过上限 {self.offset_max}，已截断")
+            query.offset = self.offset_max
+
+        cap = self._scan_limit_cap()
+        try:
+            requested = int(scan_limit) if scan_limit else self.default_scan_limit
+        except (TypeError, ValueError):
+            requested = self.default_scan_limit
+        # 下限：模型笔误（0 / -5）不应把扫描缩到 1 条然后报「没找到」。
+        floor = min(cap, max(20, self.max_fetch_per_request))
+        query.scan_limit = max(floor, min(requested, cap))
+        # 两个方向都要说明：静默抬高会让模型以为请求值生效了。
+        if requested > cap:
+            notes.append(f"scan_limit 超过上限 {cap}，已截断为 {query.scan_limit}")
+        elif requested < query.scan_limit:
+            notes.append(f"scan_limit 低于下限 {query.scan_limit}，已提升到该值")
+
+        query.keyword_case_sensitive = self.keyword_case_sensitive
+        return query, notes, None
+
+    def _locate_conditions(self, session_key: str, query):
+        return (session_key, query.since, query.until, tuple(query.user_ids),
+                tuple(query.user_names), tuple(query.keywords))
+
+    def _locate_signature(self, session_key: str, query, count: int) -> str:
+        import hashlib
+        raw = "|".join(str(x) for x in (
+            self._locate_conditions(session_key, query), query.offset,
+            query.scan_limit, count,
+        ))
+        return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+    def _locate_cache_put(self, signature, text, query, conds, reached_start, oldest_ts):
+        self._locate_cache[signature] = {
+            "data": text,
+            "timestamp": time.time(),
+            "scan_limit": query.scan_limit,
+            "conditions": conds,
+            "reached_start": bool(reached_start),
+            "oldest_ts": oldest_ts,
+        }
+        if len(self._locate_cache) > 100:
+            now = time.time()
+            for k in [k for k, v in self._locate_cache.items()
+                      if now - v.get("timestamp", 0) > 300]:
+                del self._locate_cache[k]
+
+    def _locate_start_reached(self, conds):
+        """A previous run with identical conditions already walked back to the
+        oldest message: nothing older exists, so re-scanning cannot help.
+
+        Scoped to the cache TTL: new messages arrive at the NEWEST end, so the
+        claim "walked to the very beginning" stays true for the older part but
+        the *answer* can go stale at any moment. Outside the TTL we let the
+        query through and rescan instead of refusing forever.
+        """
+        now = time.time()
+        for entry in self._locate_cache.values():
+            if entry.get("conditions") != conds or not entry.get("reached_start"):
+                continue
+            if self.locate_cache_ttl_sec > 0 and \
+                    (now - entry.get("timestamp", 0)) >= self.locate_cache_ttl_sec:
+                continue
+            return locate.fmt_ts(entry.get("oldest_ts"))
+        return None
+
+    def _locate_subset_prior(self, conds, current_limit: int):
+        for entry in self._locate_cache.values():
+            if entry.get("conditions") != conds:
+                continue
+            prior = int(entry.get("scan_limit", 0) or 0)
+            if prior > current_limit:
+                return prior
+        return None
+
+    def _charge_scan_budget(self, event, scanned: int) -> None:
+        """累计本回合扫描条数（跨调用）。
+
+        注意：空 dict 是正常状态 —— 若把空 extra 当成「无法计费」直接返回，
+        预算就永远不会被消耗，等于把防循环关掉了。
+        """
+        if scanned <= 0 or self.max_scanned_per_turn <= 0:
+            return
+        extra = self._event_extra(event)
+        if extra is None:
+            return
+        extra["merger_hist_scanned"] = int(extra.get("merger_hist_scanned", 0) or 0) + scanned
+
+    def _scan_budget_left(self, event) -> int:
+        if self.max_scanned_per_turn <= 0:
+            return 1 << 30
+        extra = self._event_extra(event)
+        used = int(extra.get("merger_hist_scanned", 0) or 0) if extra is not None else 0
+        return max(0, self.max_scanned_per_turn - used)
+
+    async def _locate_session_history(self, event, st, entity, count,
+                                      since, until, user_id, keyword,
+                                      offset, scan_limit, target_key) -> str:
+        # 先探测 OneBot 实现：扫描上限取决于它（NapCat 2000 / LLOneBot 1200 /
+        # SnowLuma 800），若放到后面探测，首次调用会被钳到保守的通用上限。
+        client = None
+        if self.use_ws:
+            client = self._get_client(event)
+        adapter_name = ""
+        try:
+            info = getattr(event, "adapter", None)
+            adapter_name = str(getattr(info, "name", None)
+                               or getattr(info, "adapter_id", "") or "")
+        except Exception:
+            adapter_name = ""
+        impl = await self._resolve_impl(client, adapter_name or st)
+
+        query, notes, error = self._build_locale_query(
+            since, until, user_id, keyword, offset, scan_limit)
+        if error:
+            return f"Error: {error}"
+
+        # 防循环：调用预算 -> 精确签名缓存 -> 已到最早 -> 子集拒绝
+        limited = self._track_and_limit(event, target_key)
+        if limited:
+            return limited
+
+        requested_scan_limit = query.scan_limit
+        conds = self._locate_conditions(target_key, query)
+        signature = self._locate_signature(target_key, query, count)
+        cached = self._locate_cache.get(signature)
+        if cached and (time.time() - cached.get("timestamp", 0)) < self.locate_cache_ttl_sec:
+            return (cached["data"]
+                    + "\n\n---\n⚠️ 本次定位条件与刚才完全相同，结果见上。"
+                    "请直接基于已有内容回答，不要重复查询；"
+                    "如需更早的消息请加大 scan_limit。")
+        reached = self._locate_start_reached(conds)
+        if reached:
+            return (f"Rejected: 上文中相同条件的查询已扫到该会话最早"
+                    f"（{reached}），更早没有消息了。请直接使用已有结果。")
+        prior = self._locate_subset_prior(conds, query.scan_limit)
+        if prior:
+            return (f"Rejected: 本次条件与上文某次查询相同，但扫描范围更小"
+                    f"（本次 {query.scan_limit} < 上次 {prior}），"
+                    "结果必然是上次的子集。请直接使用上文已有结果；"
+                    "若需更多命中，请加大 scan_limit 或收窄条件。")
+
+        budget_left = self._scan_budget_left(event)
+        if budget_left <= 0:
+            return ("Rejected: 本回合的扫描预算已用尽，请基于已有信息回答，"
+                    "不要再次调用 get_session_history。")
+        if budget_left < query.scan_limit:
+            # 说明清楚：否则后续「加大 scan_limit」的建议会引用一个本次
+            # 实际没有用到的数字。
+            notes.append(
+                f"本回合剩余扫描预算只有 {budget_left} 条，"
+                f"本次按 {budget_left} 条执行（原定 {query.scan_limit}）")
+            requested_scan_limit = budget_left
+        query.scan_limit = min(query.scan_limit, budget_left)
+
+        session_label = f"{st}:{entity}"
+        result = await self._run_locate_scan(client, impl, st, entity, query,
+                                             count, session_label)
+        if result is None:
+            self._note_failure()
+            return ("Error: 历史扫描失败（请勿重复调用，基于已有信息回答）。\n"
+                    "（定位失败，已计入熔断；本回合请勿再次查询）")
+
+        self._charge_scan_budget(event, result.scanned_count)
+        if result.report.error and not result.messages:
+            self._note_failure()
+            return f"Error: {result.report.error}"
+
+        self._note_success()
+        text = self._render_locate_result(result, query, count, session_label,
+                                          notes, requested_scan_limit)
+        self._locate_cache_put(signature, text, query, conds,
+                               result.report.reached_start, result.report.oldest_ts)
+        return text
+
+    async def _run_locate_scan(self, client, impl, st, entity, query, count,
+                               session_label):
+        """Run the scan, retrying once from the newest page if the anchor went
+        stale mid-walk (NapCat's short-id map is an LRU and can evict)."""
+        for attempt in (1, 2):
+            fetcher = self._make_page_fetcher(client, st, entity, impl)
+            local = locate.LocateQuery(**query.__dict__)
+            result = await locate.scan_backwards(
+                fetcher, impl, local,
+                session_label=session_label,
+                page_size=int(impl.get("max_page") or 30),
+                max_seconds=self.scan_max_seconds,
+                max_steps=self.MAX_SCAN_STEPS,
+                stop_when_enough=self.early_stop_on_enough,
+                detect_boundary=self.detect_boundary,
+                want_matches=count + query.offset,
+                # 复用与「最近消息」路径相同的占位判定，避免关键词命中
+                # SnowLuma 的合成占位行并把它显示给模型。
+                msg_filter=lambda m: not self._is_placeholder(m),
+            )
+            result = locate.finalize(result, count + query.offset)
+            if not result.report.error:
+                return result
+            if attempt == 2 or not self.locate_fallback_on_error:
+                return result
+            if self.logger:
+                self.logger.warning(
+                    "[history_tool] scan failed (%s); retrying from newest page",
+                    result.report.error)
+        return None
+
+    def _format_people(self, people) -> str:
+        """`涉及: 昵称[群名片:X](QQ)、...`
+
+        Each entry is ONE PERSON (aggregated by QQ) - a nickname and a group
+        card that differ are shown together rather than as two separate names.
+        Truncated at MAX_PEOPLE_SHOWN; the list is already sorted by message
+        count so the busiest speakers survive the cut.
+        """
+        shown = people[:self.MAX_PEOPLE_SHOWN]
+        text = "、".join(p.display for p in shown)
+        if len(people) > self.MAX_PEOPLE_SHOWN:
+            # "共N人" (total) rather than "等N人" (ambiguous: N total, or N more?)
+            text += "…（共%d人）" % len(people)
+        return "涉及: " + text
+
+    def _render_locate_result(self, result, query, count, session_label, notes,
+                              requested_scan_limit) -> str:
+        report = result.report
+        lines: List[str] = []
+
+        # Trim to `count` BEFORE the header is rendered: the header reports how
+        # many messages are actually being returned, and computing it from the
+        # pre-trim list makes it disagree with the body.
+        selected = result.messages
+        if count > 0 and len(selected) > count:
+            selected = selected[:count]
+        report.returned = len(selected)
+
+        if self.locate_head_meta:
+            lines.append(report.header(query, session_label))
+            if result.people:
+                lines.append(self._format_people(result.people))
+            lines.append("---")
+
+        if not selected:
+            if report.reached_start:
+                lines.append("已扫到会话最早，未找到符合条件的消息。")
+            else:
+                lines.append(
+                    f"扫描范围内未命中（已扫最近 {report.scanned} 条，未到会话最早）。")
+                lines.append(
+                    "如需继续向前，请加大 scan_limit 重试"
+                    f"（本次 {requested_scan_limit}，可试 "
+                    f"{min(max(requested_scan_limit * 3, 600), self._scan_limit_cap())}）。")
+            if notes and self.locate_head_meta:
+                lines.extend(f"（{n}）" for n in notes)
+            return "\n".join(lines)
+
+        for msg in selected:
+            lines.append(self._format_line(msg))
+
+        if report.matched_total > len(selected) and self.locate_head_meta:
+            first = query.offset + 1
+            last = query.offset + len(selected)
+            lines.append("---")
+            # With an offset these are NOT "the newest N" - say which slice of
+            # the match list is actually shown.
+            lines.append(
+                f"提示: 命中 {report.matched_total} 条，此处列出第 {first}-{last} 条。"
+                f"可用 offset={last} 查看后续命中，或用 since/until 收窄条件。")
+        if notes and self.locate_head_meta:
+            lines.extend(f"（{n}）" for n in notes)
+
+        return self._truncate_result("\n".join(lines))
