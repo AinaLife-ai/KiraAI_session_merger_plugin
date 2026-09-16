@@ -369,10 +369,13 @@ class GroupAgentQueue:
     ) -> None:
         try:
             deadline = time.time() + ttl
-            interval = 0.5
+            # 首检 50ms：其它插件 stop 本批次发生在"发布后毫秒级"，50ms 足够捕获且无感知；
+            # 之后逐步退避到 2s。正常批次会在第一次醒来时发现"授权已消费"并立即退出，
+            # 所以这段轮询的成本 ≈ 每次重放多醒一次（可忽略）。
+            interval = 0.05
             while True:
                 await asyncio.sleep(interval)
-                interval = min(2.0, interval * 1.5)
+                interval = min(2.0, interval * 1.6)
                 # ① 授权已被消费 = 本插件的 try_begin 跑过（正常接手/重新入队）
                 #    → 后续由常规释放路径（update_memory / llm_request_stopped / TTL）负责
                 if eid not in self._authorized_event_ids:

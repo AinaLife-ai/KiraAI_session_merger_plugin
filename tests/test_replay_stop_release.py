@@ -119,7 +119,7 @@ async def t2_stopped_releases_early():
         await asyncio.sleep(0.1)
     check("T2 批次阶段被 stop → 提前释放组锁", released_at is not None,
           f"3s 内未释放（TTL 兜底要等 180s）")
-    check("T2 释放延迟 ≤2s", released_at is not None and released_at <= 2.0,
+    check("T2 释放延迟 ≤0.3s（首检 50ms + 退避）", released_at is not None and released_at <= 0.3,
           f"{released_at}")
     await asyncio.sleep(0.1)
     check("T2 已调度下一批（drain）", drained["n"] >= 1, f"drained={drained['n']}")
