@@ -64,6 +64,8 @@ class GroupAgentQueue:
         self._schedule_tasks: Dict[str, asyncio.Task] = {}
         # 防止调度重发的 batch 再次被当成「冲突入队」时丢消息：标记 event_id 为已授权
         self._authorized_event_ids: Set[str] = set()
+        # 重放批次监听器：{event_id: task}（见 schedule_replay_watch）
+        self._watch_tasks: Dict[str, asyncio.Task] = {}
 
     def _log(self, msg: str, *args):
         if self.logger:
@@ -317,3 +319,102 @@ class GroupAgentQueue:
             if t and not t.done():
                 t.cancel()
         self._schedule_tasks.clear()
+        for t in list(self._watch_tasks.values()):
+            if t and not t.done():
+                t.cancel()
+        self._watch_tasks.clear()
+
+    # ---------------- 重放批次监听（批次阶段被 stop 的快速放锁） ----------------
+
+    def schedule_replay_watch(
+        self,
+        group_id: str,
+        sid: str,
+        event,
+        published_at: float = 0.0,
+        schedule_fn=None,
+        ttl_sec: float = 0.0,
+    ) -> None:
+        """监听一次重放：若它在**到达本插件之前**就被别的插件 stop，提前释放组锁。
+
+        只做监听，不改任何既有分支：正常批次会在 `try_begin` 里消费授权，
+        监听器随即退出（对既有行为零影响）。ttl_sec=0 时取 self.lock_ttl_sec。
+        """
+        if not self.enabled or event is None:
+            return
+        eid = str(getattr(event, "event_id", "") or "")
+        if not eid:
+            return
+        try:
+            ttl = float(ttl_sec) if ttl_sec and ttl_sec > 0 else float(self.lock_ttl_sec)
+            task = asyncio.create_task(
+                self._watch_replayed_batch(
+                    group_id, str(sid or ""), event, eid, float(published_at or 0.0),
+                    schedule_fn, max(1.0, ttl),
+                )
+            )
+            self._watch_tasks[eid] = task
+        except Exception:
+            pass  # 监听只是优化，失败绝不能影响主流程
+
+    async def _watch_replayed_batch(
+        self,
+        group_id: str,
+        sid: str,
+        event,
+        eid: str,
+        published_at: float,
+        schedule_fn,
+        ttl: float,
+    ) -> None:
+        try:
+            deadline = time.time() + ttl
+            interval = 0.5
+            while True:
+                await asyncio.sleep(interval)
+                interval = min(2.0, interval * 1.5)
+                # ① 授权已被消费 = 本插件的 try_begin 跑过（正常接手/重新入队）
+                #    → 后续由常规释放路径（update_memory / llm_request_stopped / TTL）负责
+                if eid not in self._authorized_event_ids:
+                    return
+                # ② 我们发布的那个 event 被 stop（批次阶段被其它插件掐停）：
+                #    框架的批次钩子循环已 return，本批次不会再有 LLM/记忆写入 → 安全放锁
+                if bool(getattr(event, "is_stopped", False)):
+                    released = False
+                    should_schedule = False
+                    async with self._lock:
+                        self._authorized_event_ids.discard(eid)
+                        st = self._state(group_id)
+                        # 双重校验：锁仍属于本次 sid，且获取时间不晚于本次发布
+                        # （防 TTL 过期后锁已被更晚的批次接手时误放）
+                        if (
+                            st.running
+                            and (not st.active_sid or st.active_sid == sid)
+                            and (not published_at or st.started_at <= published_at + 1.0)
+                        ):
+                            st.running = False
+                            st.active_sid = ""
+                            st.active_event_id = ""
+                            st.started_at = 0.0
+                            should_schedule = bool(st.queue)
+                            released = True
+                    if released:
+                        self._log(
+                            "[MERGER queue] replay batch stopped before handler; "
+                            "release group lock early group=%s sid=%s event=%s",
+                            group_id, sid, eid,
+                        )
+                        if should_schedule and schedule_fn:
+                            try:
+                                await schedule_fn(group_id)
+                            except Exception:
+                                pass
+                    return
+                if time.time() >= deadline:
+                    return  # 未消费也未停：交回原有 TTL 兜底
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return  # 监听器绝不向外抛
+        finally:
+            self._watch_tasks.pop(eid, None)

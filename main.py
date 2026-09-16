@@ -1110,6 +1110,15 @@ class SessionMergerPlugin(BasePlugin):
                 len(pending.messages),
                 batch.event_id,
             )
+            # 发布后开始监听：若本批次在到达本插件之前就被别的插件 stop（批次阶段），
+            # 提前释放组锁，不必干等 TTL（详见 group_agent_queue.schedule_replay_watch）
+            self.group_queue.schedule_replay_watch(
+                group_id,
+                pending.sid,
+                batch,
+                published_at=time.time(),
+                schedule_fn=self._schedule_group_drain,
+            )
             await bus.publish(batch)
         except Exception:
             logger.exception(
