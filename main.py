@@ -572,8 +572,12 @@ class SessionMergerPlugin(BasePlugin):
         self.group_agent_lock_ttl_sec = int(
             _q_get("group_agent_lock_ttl_sec", 180) or 180
         )
-        self.group_agent_settle_sec = float(
-            _q_get("group_agent_settle_sec", 0.4) or 0.0
+        # v2.8.1：settle 默认 0.4 → 0（组锁释放发生在 update_memory 同步落盘之后，
+        # 立即调度是安全的；旧默认 0.4 只留下"显示与实际不一致"）。存量配置迁移见
+        # resolve_settle_sec() 与 _migrate_settle_config()。
+        from group_agent_queue import resolve_settle_sec
+        self.group_agent_settle_sec, self._settle_needs_migration = resolve_settle_sec(
+            _q_get("group_agent_settle_sec", None)
         )
         self.group_agent_max_queue = int(_q_get("group_agent_max_queue", 32) or 32)
 
@@ -706,6 +710,8 @@ class SessionMergerPlugin(BasePlugin):
         self.data_dir = self.ctx.get_plugin_data_dir()
         self._load_cfg()
         self._build_components()
+        if getattr(self, "_settle_needs_migration", False):
+            self._migrate_settle_config()
 
         await log_compat_status(self.ctx.plugin_mgr, logger)
 
@@ -960,6 +966,42 @@ class SessionMergerPlugin(BasePlugin):
 
 
 
+
+    def _migrate_settle_config(self) -> None:
+        """把存量配置里的旧默认 settle（0.4）写回为 0（v2.8.1 改默认值）。
+
+        只改这一个键、且只当当前值恰好是旧默认 0.4 时才动；任何异常都只 warning，
+        运行时值早已按 0 生效，不影响功能。
+        """
+        self._settle_needs_migration = False
+        try:
+            import json
+            from core.utils.path_utils import get_config_path
+
+            path = get_config_path() / "plugins" / "kira_session_merger.json"
+            if not path.exists():
+                return
+            data = json.loads(path.read_text(encoding="utf-8")) or {}
+            sec = data.get("section_group_agent_queue")
+            if not isinstance(sec, dict):
+                return
+            cur = sec.get("group_agent_settle_sec")
+            try:
+                cur_v = float(cur)
+            except (TypeError, ValueError):
+                return
+            if abs(cur_v - 0.4) > 1e-9:
+                return
+            sec["group_agent_settle_sec"] = 0
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, indent=4, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+            logger.info(
+                "[MERGER] 配置迁移：group_agent_settle_sec 0.4 → 0"
+                "（落盘后立即调度下一批；如需缓冲可在 WebUI 改回）"
+            )
+        except Exception as e:
+            logger.warning("[MERGER] settle 配置迁移写回失败（运行时已按 0 生效）: %s", e)
 
     async def terminate(self):
         if self.observe_pool:

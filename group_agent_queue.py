@@ -36,6 +36,30 @@ class GroupRunState:
     queued_sids: Set[str] = field(default_factory=set)
 
 
+# settle 的旧默认值（v2.8.1 起默认改为 0 = 落盘后立即调度）
+SETTLE_OLD_DEFAULT = 0.4
+
+
+def resolve_settle_sec(raw, default: float = 0.0) -> "tuple[float, bool]":
+    """把配置里的 settle 原始值解析成 (生效值, 是否触发了 v2.8.1 默认迁移)。
+
+    规则（纯函数，无框架依赖，便于测试）：
+      · 未配置（None）→ (default, False)
+      · 非法值       → (default, False)
+      · 恰为旧默认 0.4 → (default, True)   ← 存量默认值迁移（不是用户特意改的值）
+      · 其它值        → (max(0, v), False) ← 用户显式选择，原样尊重
+    """
+    if raw is None:
+        return float(default), False
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return float(default), False
+    if abs(v - SETTLE_OLD_DEFAULT) < 1e-9:
+        return float(default), True
+    return (max(0.0, v), False)
+
+
 class GroupAgentQueue:
     """
     按 group_id 串行化 agent。

@@ -32,7 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-from group_agent_queue import GroupAgentQueue  # noqa: E402
+from group_agent_queue import GroupAgentQueue, resolve_settle_sec  # noqa: E402
 
 results = []
 
@@ -176,7 +176,19 @@ async def t6_clear_all_cancels():
           not q._authorized_event_ids and not q._states)
 
 
+async def t7_settle_migration():
+    """v2.8.1：settle 默认 0.4 → 0；只迁移"旧默认值"，用户显式改过的值原样尊重。"""
+    check("S1 未配置 → 0（新默认）", resolve_settle_sec(None) == (0.0, False))
+    check("S2 旧默认 0.4 → 迁移为 0（并标记需写回）", resolve_settle_sec(0.4) == (0.0, True))
+    check("S3 用户显式值 1.5 → 保留", resolve_settle_sec(1.5) == (1.5, False))
+    check("S4 用户显式 0 → 0（不触发迁移）", resolve_settle_sec(0) == (0.0, False))
+    check("S5 负数 → 归零", resolve_settle_sec(-3) == (0.0, False))
+    check("S6 非法值 → 0（不炸）", resolve_settle_sec("abc") == (0.0, False))
+    check("S7 字符串 0.4 也按旧默认迁移", resolve_settle_sec("0.4") == (0.0, True))
+
+
 async def main():
+    await t7_settle_migration()
     await t1_consumed_no_release()
     await t2_stopped_releases_early()
     await t3_not_stopped_no_release()
