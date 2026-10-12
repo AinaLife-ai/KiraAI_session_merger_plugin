@@ -211,6 +211,8 @@ class SessionMergerPlugin(BasePlugin):
         self.merge_all_groups = bool(mode.get("merge_all_groups", True))
         self.merge_all_dms = bool(mode.get("merge_all_dms", True))
         self.merge_groups_with_dms = bool(mode.get("merge_groups_with_dms", True))
+        # 跨适配器合并（如把 webchat 面板会话与 QQ 会话并入同一条时间线）
+        self.merge_across_adapters = bool(mode.get("merge_across_adapters", False))
         self.max_merge_sessions = int(mode.get("max_merge_sessions", 8) or 8)
 
         extra = mode.get("extra_sessions", None)
@@ -608,6 +610,7 @@ class SessionMergerPlugin(BasePlugin):
             merge_all_groups=self.merge_all_groups,
             merge_all_dms=self.merge_all_dms,
             merge_groups_with_dms=self.merge_groups_with_dms,
+            merge_across_adapters=self.merge_across_adapters,
             extra_sessions=self.extra_sessions,
             exclude_sessions=self.exclude_sessions,
         )
@@ -1129,14 +1132,13 @@ class SessionMergerPlugin(BasePlugin):
         plugin = self
         orig = self._orig_update_memory
 
-        def wrapped_update_memory(session, new_chunk, *args, **kwargs):
-            result = orig(session, new_chunk, *args, **kwargs)
+        def _post_write(session):
             try:
                 if plugin.enabled and plugin.group_queue and plugin.resolver:
                     sid = str(session or "")
                     gid = plugin.resolver.resolve_group_id(sid)
                     if gid:
-                        # 同步钩子里调度异步 drain
+                        # 调度异步 drain（钩子在真实落盘之后执行）
                         try:
                             loop = asyncio.get_running_loop()
                             loop.create_task(
@@ -1146,7 +1148,23 @@ class SessionMergerPlugin(BasePlugin):
                             pass
             except Exception:
                 logger.exception("[MERGER queue] post update_memory hook failed")
-            return result
+
+        import inspect as _inspect
+        if _inspect.iscoroutinefunction(orig):
+            # 3.0 起 update_memory 已异步化：包装器必须同为 async，
+            # 先 await 真实落盘，再触发组队列 drain。
+            async def wrapped_update_memory(session, new_chunk, *args, **kwargs):
+                result = orig(session, new_chunk, *args, **kwargs)
+                if _inspect.isawaitable(result):
+                    result = await result
+                _post_write(session)
+                return result
+        else:
+            # 2.x：同步实现保持同步包装（调用方不 await）
+            def wrapped_update_memory(session, new_chunk, *args, **kwargs):
+                result = orig(session, new_chunk, *args, **kwargs)
+                _post_write(session)
+                return result
 
         wrapped_update_memory._merger_memory_wrapped = True  # type: ignore
         sm.update_memory = wrapped_update_memory
@@ -1165,6 +1183,12 @@ class SessionMergerPlugin(BasePlugin):
         self._memory_write_wrapped = False
 
     async def _on_session_memory_written(self, event):
+        # 外部写入后镜像即过期（3.0）；2.x live dict 直通此调用不做事
+        try:
+            from .session_mirror import invalidate_mirror
+            invalidate_mirror(getattr(self.ctx, "session_mgr", None))
+        except Exception:
+            pass
         """框架会话记忆被写入：写入为空（用户清空会话）时丢弃该会话的摘要状态。"""
         payload = getattr(event, "payload", None) or {}
         sid = payload.get("session")
@@ -1172,6 +1196,12 @@ class SessionMergerPlugin(BasePlugin):
             self._forget_session_state(sid)
 
     async def _on_session_deleted(self, event):
+        try:
+            from .session_mirror import invalidate_mirror
+            _p = getattr(event, "payload", None) or {}
+            invalidate_mirror(getattr(self.ctx, "session_mgr", None), _p.get("session"))
+        except Exception:
+            pass
         """框架会话被删除：丢弃该会话的累计摘要与暂存。"""
         payload = getattr(event, "payload", None) or {}
         sid = payload.get("session")
@@ -1188,6 +1218,11 @@ class SessionMergerPlugin(BasePlugin):
         logger.info("[MERGER] session cleared/deleted: summary state dropped sid=%s", sid)
 
     async def _on_group_memory_written(self, sid: str, group_id: str):
+        from .session_mirror import refresh_mirror
+        try:
+            await refresh_mirror(self.session_mgr)
+        except Exception:
+            pass
         if not self.group_queue:
             return
         await self.group_queue.on_memory_written(
@@ -1406,12 +1441,18 @@ class SessionMergerPlugin(BasePlugin):
             logger.exception("[MERGER] collect merge sids failed")
         return ordered
 
-    def _clear_session_context(self, sid: str) -> bool:
-        """清除单个会话上下文（对齐 reboot_plugin：delete_session）。"""
+    async def _clear_session_context(self, sid: str) -> bool:
+        """清空单个会话上下文（**保留**会话标题/能力设置等元数据）。
+
+        原为 delete_session 整删 —— 会把会话级能力开关一起抹掉；
+        现两代都改为内容置空（对齐 reboot 的 memory_only 默认语义）：
+        2.x write_memory(sid, [])；3.0 update_session(sid, content=[])。
+        """
         sm = getattr(self.ctx, "session_mgr", None)
         if sm is None or not sid:
             return False
-        sm.delete_session(sid)
+        from .session_mirror import sm_clear
+        await sm_clear(sm, sid)
         return True
 
     async def _reply(self, sid: str, text: str):
@@ -1642,6 +1683,11 @@ class SessionMergerPlugin(BasePlugin):
             )
 
     async def _handle_reboot_all(self, event: KiraMessageEvent, sid: str):
+        from .session_mirror import refresh_mirror
+        try:
+            await refresh_mirror(self.session_mgr, force=True)
+        except Exception:
+            pass
         """清除所有参与合并的会话上下文（参考 reboot_plugin）。"""
         user_id = self._get_event_user_id(event)
         user_name = self._get_event_user_name(event)
@@ -1680,7 +1726,7 @@ class SessionMergerPlugin(BasePlugin):
             fail_count = 0
             for target_sid in targets:
                 try:
-                    if self._clear_session_context(target_sid):
+                    if await self._clear_session_context(target_sid):
                         ok_count += 1
                     else:
                         fail_count += 1
@@ -1753,6 +1799,11 @@ class SessionMergerPlugin(BasePlugin):
             )
 
     async def _handle_status(self, sid: str):
+        from .session_mirror import refresh_mirror
+        try:
+            await refresh_mirror(self.session_mgr)
+        except Exception:
+            pass
         if not self.resolver or not self.engine:
             await self._reply(sid, "合并引擎未初始化")
             return
@@ -1783,6 +1834,11 @@ class SessionMergerPlugin(BasePlugin):
         await self._reply(sid, "\n".join(lines))
 
     async def _handle_preview(self, sid: str):
+        from .session_mirror import refresh_mirror
+        try:
+            await refresh_mirror(self.session_mgr)
+        except Exception:
+            pass
         if not self.engine:
             await self._reply(sid, "合并引擎未初始化")
             return
@@ -1864,6 +1920,12 @@ class SessionMergerPlugin(BasePlugin):
     async def on_llm_request(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         if not self.enabled or not self.engine:
             return
+        # 3.0 下先刷新会话镜像（2.x 直通不做事）；同步合并链路只读镜像
+        from .session_mirror import refresh_mirror
+        try:
+            await refresh_mirror(self.session_mgr)
+        except Exception:
+            pass
 
         # 缓存修复：time 段挪到队尾（幂等），让 system+记忆成为稳定前缀
         if self.move_time_to_tail:
@@ -2133,6 +2195,11 @@ class SessionMergerPlugin(BasePlugin):
     @on.step_result(priority=Priority.LOW)
     async def on_step_result_continuous_compress(self, event, *_):
         """每次回复后检查是否需要继续后台压缩（阈值触发）。"""
+        from .session_mirror import refresh_mirror
+        try:
+            await refresh_mirror(self.session_mgr)
+        except Exception:
+            pass
         if not self.enabled or not self.engine:
             return
         try:

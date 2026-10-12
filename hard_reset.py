@@ -15,6 +15,8 @@ v2（借鉴 ContextCondensation）：
 from typing import List, Optional
 
 from .summarizer import SUMMARY_MARKER, extract_summary_text
+from .memory_access import safe_fetch_memory
+from .session_mirror import defer_or_recreate, defer_or_write
 
 
 def _clean_and_chunk(flat: List[dict]) -> List[List[dict]]:
@@ -139,6 +141,7 @@ def hard_reset_session(
     logger=None,
     summary_chunk: Optional[list] = None,
     write_through: bool = True,
+    defer: Optional[list] = None,
 ) -> int:
     """
     对单个 sid：读记忆 → 剥离旧摘要 → 保留最近 keep_turns 轮 → 融合摘要写回。
@@ -150,7 +153,7 @@ def hard_reset_session(
         return -1
     keep_turns = max(1, int(keep_turns or 1))
     try:
-        old_flat = _norm_messages(session_mgr.fetch_memory(sid) or [])
+        old_flat = _norm_messages(safe_fetch_memory(session_mgr, sid) or [])
         _head, rest = _split_head_summary(old_flat)
         chunks = _clean_and_chunk(rest)
         if not chunks:
@@ -162,22 +165,13 @@ def hard_reset_session(
 
         to_write = build_fused_chunks(kept_chunks, summary_chunk)
 
+        # 双世代写回（特征识别，不绑版本号）：
+        #   2.x：直写（write_memory / delete+重建，本函数在 to_thread 线程区运行）；
+        #   3.0：异步接口不能在此 await —— 写操作入 defer 队列，由异步调用方冲刷。
         if write_through:
-            data = getattr(session_mgr, "chat_memory", None)
-            if not isinstance(data, dict) or sid not in data:
-                # write_memory 是下标赋值，session 必须先存在
-                try:
-                    session_mgr.get_session_info(sid)
-                except Exception:
-                    pass
-            session_mgr.write_memory(sid, to_write)
+            defer_or_write(session_mgr, sid, to_write, defer, logger=logger)
         else:
-            session_mgr.delete_session(sid)
-            try:
-                session_mgr.get_session_info(sid)
-            except Exception:
-                pass
-            session_mgr.write_memory(sid, to_write)
+            defer_or_recreate(session_mgr, sid, to_write, defer, logger=logger)
 
         if logger:
             logger.warning(
@@ -199,8 +193,9 @@ def hard_reset_members(
     sids: List[str],
     keep_turns: int,
     logger=None,
-    summary_chunks: Optional[dict] = None,
+    summary_chunks=None,
     write_through: bool = True,
+    defer: Optional[list] = None,
 ) -> dict:
     """summary_chunks: sid -> summary_chunk 映射（可选，重开前摘要）。"""
     results = {}
@@ -208,6 +203,6 @@ def hard_reset_members(
         sc = (summary_chunks or {}).get(sid)
         results[sid] = hard_reset_session(
             session_mgr, sid, keep_turns, logger, summary_chunk=sc,
-            write_through=write_through,
+            write_through=write_through, defer=defer,
         )
     return results

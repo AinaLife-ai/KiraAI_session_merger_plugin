@@ -148,7 +148,7 @@ def list_enabled_adapters(ctx) -> List[Tuple[str, str]]:
     return out
 
 
-def resolve_target_sid(ctx, target: str) -> Tuple[Optional[str], Optional[str]]:
+async def resolve_target_sid(ctx, target: str) -> Tuple[Optional[str], Optional[str]]:
     """
     校正 target 的 adapter 前缀（LLM 可能照工具描述示例脑补前缀）。
     返回 (sid, None) 或 (None, 可读错误)。
@@ -179,7 +179,12 @@ def resolve_target_sid(ctx, target: str) -> Tuple[Optional[str], Optional[str]]:
     if sm is not None:
         try:
             valid = {n for n, _ in adapters}
-            for info in sm.get_session_info() or []:
+            # 双世代：2.x get_session_info() 同步列表；3.0 起 get_sessions 异步
+            if hasattr(sm, "get_session_info"):
+                _infos = sm.get_session_info() or []
+            else:
+                _infos = await sm.get_sessions(include_content=False) or []
+            for info in _infos:
                 s = str(getattr(info, "sid", "") or "")
                 p = s.split(":")
                 if (
@@ -279,7 +284,7 @@ async def route_cross_session_request(
             "failed: cross-session hop limit reached; "
             "answer in the current session instead of routing further."
         )
-    resolved, err = resolve_target_sid(ctx, target)
+    resolved, err = await resolve_target_sid(ctx, target)
     if err:
         if logger:
             logger.warning(

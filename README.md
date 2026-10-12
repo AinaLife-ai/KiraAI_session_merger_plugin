@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.8.5** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2）
+**版本 2.9.0** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2、3.0 全系列）
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 >
@@ -22,6 +22,10 @@ KiraAI 默认行为：**每个群聊、每个私聊各自独立记忆**，换一
 4. 把"去私聊/去群里"变成真正的跨窗口路由
 
 **一句话：一个大脑 + 一条时间线 + 组内排队执行。**
+
+> **兼容性（v2.9.0）**：支持 KiraAI 2.29.6+ 与 **3.0 全系列**（含 v3.0.0-rc.1；特征识别，不绑版本号）：
+> - 3.0 rc.1 起官方会话记忆改为 SQLite + 全异步接口，本插件新增 `session_mirror.py` 双世代会话层：同步合并链路读「会话镜像」（异步入口预热、TTL 节流），写走 `update_session` upsert（**重开/清空照旧保留会话标题与能力设置**，不再整删）；线程区写入经延迟队列由异步方冲刷（超时僵尸线程也有完成回调兜底）。
+> - 新特性：**跨适配器合并**（`merge_across_adapters`，默认关）。开启后所有适配器的会话并入同一组——典型用法是把 webui 内置聊天 `webchat:dm:admin` 与 QQ 群/私聊合成同一条时间线（3.0 起）。不开启时行为与旧版逐字一致。
 
 ---
 
@@ -370,6 +374,13 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.9.0
+
+- **3.0 rc.1 兼容：会话镜像双世代层（新增 `session_mirror.py`）**——rc.1 移除常驻 `chat_memory` 与全部同步记忆 API（`fetch_memory`/`read_memory`/`write_memory`/`get_session_info`/`get_memory_count`），旧实现直读内部 dict ⇒ **静默全损（合并永远为空）**。现为 3.0 提供 chat_memory 等价镜像（异步入口预热 + 同步读点只读缓存），`hard_reset`/`merge_engine`/`cross_session` 全链路双世代化；2.x 原路径零改动
+- **清空会话改为只清对话内容**：不再 delete+重建（会连会话标题/能力设置一起抹掉），3.0 走 `update_session(sid, content=[])`
+- **跨适配器合并（默认关）**：新增 `merge_across_adapters` 开关，`webchat` 适配器入局（rc.1 内置适配器，`webchat:dm:admin`），与 `allowed_adapters` 白名单联动实测有效
+- 版本 2.8.5 → 2.9.0
 
 ### 2.8.5
 

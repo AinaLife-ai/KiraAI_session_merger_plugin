@@ -74,6 +74,12 @@
         "minimum": 0,
         "maximum": 600,
         "hint": "合并启用后会接管 session_send，把请求路由到目标会话并继续执行。同一源→同一目标成功路由后，在此秒内重复调用会被拦截。0 表示关闭。"
+      },
+      "merge_across_adapters": {
+        "type": "bool",
+        "name": "跨适配器合并",
+        "default": false,
+        "hint": "开启后所有适配器的会话合并到同一组（不再按适配器分治）。典型用法：把 webui 内置聊天 webchat:dm:admin 与 QQ 会话并入同一条时间线（3.0 起）。只想合其中几个适配器（如 QQ + webchat、不含微信）时：开启本开关，并把「允许的适配器」填为 qq,webchat 即可——白名单照常生效。"
       }
     }
   },

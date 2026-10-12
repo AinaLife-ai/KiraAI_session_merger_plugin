@@ -7,13 +7,31 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from .session_mirror import peek_mirror
 from .timeout_utils import is_expired, session_type_of
+
+
+def _chat_data(session_mgr) -> Optional[dict]:
+    """会话内容字典源（双世代）。
+
+    2.x：直读 live ``chat_memory``（同步、始终新鲜）；
+    3.0 rc.1+：无常驻缓存（SQLite 持久化），读 ``SessionMirror`` ——
+    由异步入口（消息钩子/命令/工具/API）先 ``refresh_mirror`` 预热。
+    镜像为空时返回 {}（与"无会话"语义一致），绝不抛错。
+    """
+    data = getattr(session_mgr, "chat_memory", None)
+    if isinstance(data, dict):
+        return data
+    try:
+        return peek_mirror(session_mgr)
+    except Exception:
+        return {}
 
 
 def list_existing_session_ids(session_mgr) -> List[str]:
     if not session_mgr:
         return []
-    data = getattr(session_mgr, "chat_memory", None)
+    data = _chat_data(session_mgr)
     if not isinstance(data, dict):
         return []
     return list(data.keys())
@@ -23,7 +41,7 @@ def safe_session_meta(session_mgr, sid: str) -> Dict[str, Any]:
     empty = {"title": "", "timestamp": 0, "description": "", "chunk_count": 0}
     if not session_mgr or not sid:
         return empty
-    data = getattr(session_mgr, "chat_memory", None)
+    data = _chat_data(session_mgr)
     if not isinstance(data, dict) or sid not in data:
         return empty
     sd = data.get(sid) or {}
@@ -49,7 +67,7 @@ def safe_read_memory(
     """按 chunk 结构只读记忆（不触发 _ensure_session_data 写盘），无会话返回 []。"""
     if not session_mgr or not sid:
         return []
-    data = getattr(session_mgr, "chat_memory", None)
+    data = _chat_data(session_mgr)
     if not isinstance(data, dict) or sid not in data:
         return []
     mem_list = (data.get(sid) or {}).get("memory") or []
@@ -79,7 +97,7 @@ def safe_fetch_memory(
 ) -> List[dict]:
     if not session_mgr or not sid:
         return []
-    data = getattr(session_mgr, "chat_memory", None)
+    data = _chat_data(session_mgr)
     if not isinstance(data, dict) or sid not in data:
         return []
     session_data = data.get(sid) or {}
