@@ -22,6 +22,7 @@ class GroupResolver:
         merge_groups_with_dms: bool = True,
         extra_sessions: Optional[List[str]] = None,
         exclude_sessions: Optional[List[str]] = None,
+        merge_across_adapters: bool = False,
     ):
         self.session_mgr = session_mgr
         self.enabled = enabled
@@ -31,6 +32,9 @@ class GroupResolver:
         self.merge_all_groups = merge_all_groups
         self.merge_all_dms = merge_all_dms
         self.merge_groups_with_dms = merge_groups_with_dms
+        # 跨适配器合并：True 时所有适配器的会话归入同一个 all_merged 组
+        #（典型用法：webchat:dm:admin 与 QQ 会话共享同一条人生时间线）
+        self.merge_across_adapters = bool(merge_across_adapters)
         self.extra_sessions = [s.strip() for s in (extra_sessions or []) if str(s).strip()]
         self.exclude_sessions = set(
             s.strip() for s in (exclude_sessions or []) if str(s).strip()
@@ -86,6 +90,10 @@ class GroupResolver:
         adapter = meta["adapter"] or "unknown"
         st = meta["session_type"]
 
+        # 跨适配器互通（含 webchat 等内置适配器）：全部会话同组
+        if self.merge_across_adapters:
+            return self.GROUP_ALL
+
         # 群私互通：同一条人生时间线
         if self.merge_groups_with_dms:
             return f"{adapter}:{self.GROUP_ALL}"
@@ -102,8 +110,13 @@ class GroupResolver:
             return []
         parts = group_id.split(":", 1)
         if len(parts) != 2:
-            return []
-        adapter, gtype = parts[0], parts[1]
+            # 跨适配器组（无前缀的 all_merged）：不筛适配器
+            if group_id == self.GROUP_ALL:
+                adapter, gtype = None, self.GROUP_ALL
+            else:
+                return []
+        else:
+            adapter, gtype = parts[0], parts[1]
 
         known = set(self.list_known_sessions())
         known.update(self.extra_sessions)
@@ -113,7 +126,7 @@ class GroupResolver:
             if sid in self.exclude_sessions:
                 continue
             meta = self.parse_sid(sid)
-            if meta["adapter"] != adapter:
+            if adapter is not None and meta["adapter"] != adapter:
                 continue
             if not self._adapter_allowed(meta["adapter"]):
                 continue

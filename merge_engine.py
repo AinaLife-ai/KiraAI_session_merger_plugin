@@ -17,6 +17,9 @@ from .hard_reset import (
     read_reset_parts,
 )
 from .memory_access import pick_member_sids
+from .session_mirror import (
+    flush_deferred, refresh_mirror, sm_read_chunks, sm_write_chunks,
+)
 from .observe_pool import ObservePool
 from .reset_policy import (
     SoftResetState,
@@ -398,6 +401,7 @@ class MergeEngine:
         summary_chunks: Optional[dict] = None,
         out_info: Optional[dict] = None,
         summary_texts: Optional[dict] = None,
+        defer: Optional[list] = None,
     ) -> List[OpenAIMessage]:
         """
         流程：
@@ -484,6 +488,7 @@ class MergeEngine:
                             logger=self.logger,
                             summary_chunks=sub_summaries,
                             write_through=self.write_through,
+                            defer=defer,
                         )
                     if out_info is not None:
                         out_info["hard_reset_sids"] = list(reset_members)
@@ -595,7 +600,11 @@ class MergeEngine:
         summary_chunks: Optional[dict] = None,
         out_info: Optional[dict] = None,
         summary_texts: Optional[dict] = None,
+        defer_q: Optional[list] = None,
     ) -> bool:
+        # 3.0 下线程区不能 await：写操作入延迟队列，由异步方冲刷
+        if defer_q is None:
+            defer_q = []
         t0 = time.perf_counter()
         sid = getattr(event, "sid", None) or ""
         if not sid or not self.should_merge(sid):
@@ -606,6 +615,7 @@ class MergeEngine:
             summary_chunks=summary_chunks,
             out_info=out_info,
             summary_texts=summary_texts,
+            defer=defer_q,
         )
 
         systems = []
@@ -959,7 +969,7 @@ class MergeEngine:
             return False
         try:
             async with self._async_reset_lock(group_id):
-                chunks = self.session_mgr.read_memory(sid) or []
+                chunks = await sm_read_chunks(self.session_mgr, sid)
                 cur_head = ""
                 if chunks and is_summary_chunk(chunks[0]):
                     cur_head = extract_summary_text(
@@ -974,8 +984,8 @@ class MergeEngine:
                     chunks[0] = [summary_msg] + list(chunks[0])
                 else:
                     chunks = [[summary_msg]]
-                # write_memory 是同步全量 JSON 落盘，挪到线程避免冻结事件循环
-                await asyncio.to_thread(self.session_mgr.write_memory, sid, chunks)
+                # 双世代：2.x 同步全量落盘挪线程；3.0 原生异步 upsert（见 session_mirror）
+                await sm_write_chunks(self.session_mgr, sid, chunks)
             self._update_store_after_reset([sid], {sid: new_final})
             if self.logger:
                 self.logger.info(
@@ -1260,7 +1270,7 @@ class MergeEngine:
             return
         try:
             async with self._async_reset_lock(group_id):
-                chunks = self.session_mgr.read_memory(sid) or []
+                chunks = await sm_read_chunks(self.session_mgr, sid)
                 summary_msg = build_summary_chunk(final)[0]
                 if chunks and is_summary_chunk(chunks[0]):
                     chunks[0] = [summary_msg] + list(chunks[0][1:])
@@ -1268,8 +1278,8 @@ class MergeEngine:
                     chunks[0] = [summary_msg] + list(chunks[0])
                 else:
                     chunks = [[summary_msg]]
-                # write_memory 是同步全量 JSON 落盘，挪到线程避免冻结事件循环
-                await asyncio.to_thread(self.session_mgr.write_memory, sid, chunks)
+                # 双世代：2.x 同步全量落盘挪线程；3.0 原生异步 upsert（见 session_mirror）
+                await sm_write_chunks(self.session_mgr, sid, chunks)
             self._update_store_after_reset([sid], {sid: final})
             if self.logger:
                 self.logger.info("[MERGER summary] async summary written for %s", sid)
@@ -1556,7 +1566,7 @@ class MergeEngine:
                     # （threading.Lock 在事件循环里等待 LLM 会阻塞整个 loop）
                     for _attempt in range(2):
                         async with self._async_reset_lock(group_id):
-                            chunks = self.session_mgr.read_memory(sid) or []
+                            chunks = await sm_read_chunks(self.session_mgr, sid)
                             cur_head = ""
                             if chunks and is_summary_chunk(chunks[0]):
                                 cur_head = extract_summary_text(
@@ -1570,10 +1580,8 @@ class MergeEngine:
                                     chunks[0] = [summary_msg] + list(chunks[0])
                                 else:
                                     chunks = [[summary_msg]]
-                                # write_memory 是同步全量 JSON 落盘，挪到线程
-                                await asyncio.to_thread(
-                                    self.session_mgr.write_memory, sid, chunks
-                                )
+                                # 双世代：2.x 同步全量落盘挪线程；3.0 原生异步 upsert
+                                await sm_write_chunks(self.session_mgr, sid, chunks)
                                 self._update_store_after_reset([sid], {sid: final})
                                 if self.logger:
                                     self.logger.info(
@@ -1776,13 +1784,14 @@ class MergeEngine:
                 self.logger.exception("[MERGER summary] precheck failed (swallowed)")
 
         out_info: dict = {}
+        defer_q: list = []
+        await refresh_mirror(self.session_mgr)
+        _task = asyncio.ensure_future(asyncio.to_thread(
+            self._apply_sync, event, req, summary_chunks, out_info, sync_finals, defer_q
+        ))
         try:
-            ok = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._apply_sync, event, req, summary_chunks, out_info, sync_finals
-                ),
-                timeout=self._merge_timeout(),
-            )
+            ok = await asyncio.wait_for(asyncio.shield(_task), timeout=self._merge_timeout())
+            await flush_deferred(self.session_mgr, defer_q, logger=self.logger)
         except asyncio.TimeoutError:
             if self.logger:
                 self.logger.warning(
@@ -1790,6 +1799,15 @@ class MergeEngine:
                     self._merge_timeout(),
                     self.merge_reset_mode,
                 )
+            # to_thread 不可取消：线程仍在跑，迟到的延迟写由完成回调兜底冲刷
+            def _flush_late(_t, _q=defer_q):
+                if _q:
+                    try:
+                        asyncio.get_running_loop().create_task(
+                            flush_deferred(self.session_mgr, _q, logger=self.logger))
+                    except Exception:
+                        pass
+            _task.add_done_callback(_flush_late)
             return False
         except Exception:
             if self.logger:
