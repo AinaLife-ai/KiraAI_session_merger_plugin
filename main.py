@@ -1218,6 +1218,11 @@ class SessionMergerPlugin(BasePlugin):
         logger.info("[MERGER] session cleared/deleted: summary state dropped sid=%s", sid)
 
     async def _on_group_memory_written(self, sid: str, group_id: str):
+        from .session_mirror import refresh_mirror
+        try:
+            await refresh_mirror(self.session_mgr)
+        except Exception:
+            pass
         if not self.group_queue:
             return
         await self.group_queue.on_memory_written(
@@ -2190,6 +2195,11 @@ class SessionMergerPlugin(BasePlugin):
     @on.step_result(priority=Priority.LOW)
     async def on_step_result_continuous_compress(self, event, *_):
         """每次回复后检查是否需要继续后台压缩（阈值触发）。"""
+        from .session_mirror import refresh_mirror
+        try:
+            await refresh_mirror(self.session_mgr)
+        except Exception:
+            pass
         if not self.enabled or not self.engine:
             return
         try:
