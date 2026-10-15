@@ -8,6 +8,37 @@ from typing import Dict, List, Optional
 from core.plugin import BasePlugin, logger, on, Priority, register
 from core.provider import LLMRequest
 from core.chat.message_utils import KiraMessageBatchEvent, KiraMessageEvent, KiraIMSentResult
+
+
+# ── 双世代兼容（KiraAI 3.0 GA 弃用面，DEP-2/3）─────────────────────
+# 事件类首字段：2.x = message_types；3.0 = supported_elements（旧名仍收但已弃用）。
+def elements_kw(cls, value):
+    """按当前框架事件类的字段名构造关键字参数（dataclasses 探测，不绑版本号）。"""
+    try:
+        from dataclasses import fields as _dc_fields
+        names = {f.name for f in _dc_fields(cls)}
+    except Exception:
+        names = set()
+    key = "supported_elements" if "supported_elements" in names else "message_types"
+    return {key: value}
+
+
+def adapter_supported_elements(adapter, fallback=None):
+    """双世代取适配器支持的元素类型：3.0 走 IMCapability 元数据；2.x 读 message_types。"""
+    get_cap = getattr(adapter, "get_capability", None)
+    if callable(get_cap):
+        try:
+            from core.adapter.capabilities import IMCapability
+            meta = get_cap(IMCapability).get_message_metadata()
+            els = getattr(meta, "supported_elements", None)
+            if els is not None:
+                return list(els)
+        except Exception:
+            pass
+    els = getattr(adapter, "message_types", None)
+    if els is not None:
+        return list(els)
+    return list(fallback or [])
 from core.chat import MessageChain
 from core.chat.message_elements import Text
 
@@ -753,6 +784,9 @@ class SessionMergerPlugin(BasePlugin):
             bus = getattr(self.ctx, "event_bus", None)
             if bus is not None:
                 bus.subscribe("session_memory_written", self._on_session_memory_written)
+                # 追加事件（新消息入记忆）：3.0 的镜像靠事件保持新鲜 —— 不订阅会在
+                # TTL 窗口内读到旧镜像，漏掉刚写入的消息（摘要差量/重开判定被带偏）。
+                bus.subscribe("session_memory_updated", self._on_session_memory_updated)
                 bus.subscribe("session_deleted", self._on_session_deleted)
                 self._event_bus = bus
         except Exception as e:
@@ -1077,6 +1111,7 @@ class SessionMergerPlugin(BasePlugin):
         if bus is not None:
             try:
                 bus.unsubscribe("session_memory_written", self._on_session_memory_written)
+                bus.unsubscribe("session_memory_updated", self._on_session_memory_updated)
                 bus.unsubscribe("session_deleted", self._on_session_deleted)
             except Exception:
                 pass
@@ -1195,6 +1230,15 @@ class SessionMergerPlugin(BasePlugin):
         if sid and not payload.get("new_memory"):
             self._forget_session_state(sid)
 
+    async def _on_session_memory_updated(self, event):
+        # 追加写入（新消息入记忆）：只让镜像失效，摘要状态不动（这不是清空）。
+        try:
+            from .session_mirror import invalidate_mirror
+            _p = getattr(event, "payload", None) or {}
+            invalidate_mirror(getattr(self.ctx, "session_mgr", None), _p.get("session"))
+        except Exception:
+            pass
+
     async def _on_session_deleted(self, event):
         try:
             from .session_mirror import invalidate_mirror
@@ -1220,7 +1264,7 @@ class SessionMergerPlugin(BasePlugin):
     async def _on_group_memory_written(self, sid: str, group_id: str):
         from .session_mirror import refresh_mirror
         try:
-            await refresh_mirror(self.session_mgr)
+            await refresh_mirror(getattr(self.ctx, "session_mgr", None))
         except Exception:
             pass
         if not self.group_queue:
@@ -1259,7 +1303,7 @@ class SessionMergerPlugin(BasePlugin):
 
         try:
             batch = KiraMessageBatchEvent(
-                message_types=pending.message_types or [],
+                **elements_kw(KiraMessageBatchEvent, pending.message_types or []),
                 timestamp=int(time.time()),
                 adapter=pending.adapter,
                 session=pending.session,
@@ -1456,7 +1500,7 @@ class SessionMergerPlugin(BasePlugin):
         return True
 
     async def _reply(self, sid: str, text: str):
-        await self.ctx.message_processor.send_message_chain(
+        await self.ctx.send_message_chain(
             session=sid,
             chain=MessageChain([Text(text)]),
         )
@@ -1685,7 +1729,7 @@ class SessionMergerPlugin(BasePlugin):
     async def _handle_reboot_all(self, event: KiraMessageEvent, sid: str):
         from .session_mirror import refresh_mirror
         try:
-            await refresh_mirror(self.session_mgr, force=True)
+            await refresh_mirror(getattr(self.ctx, "session_mgr", None), force=True)
         except Exception:
             pass
         """清除所有参与合并的会话上下文（参考 reboot_plugin）。"""
@@ -1801,7 +1845,7 @@ class SessionMergerPlugin(BasePlugin):
     async def _handle_status(self, sid: str):
         from .session_mirror import refresh_mirror
         try:
-            await refresh_mirror(self.session_mgr)
+            await refresh_mirror(getattr(self.ctx, "session_mgr", None))
         except Exception:
             pass
         if not self.resolver or not self.engine:
@@ -1836,7 +1880,7 @@ class SessionMergerPlugin(BasePlugin):
     async def _handle_preview(self, sid: str):
         from .session_mirror import refresh_mirror
         try:
-            await refresh_mirror(self.session_mgr)
+            await refresh_mirror(getattr(self.ctx, "session_mgr", None))
         except Exception:
             pass
         if not self.engine:
@@ -1923,7 +1967,7 @@ class SessionMergerPlugin(BasePlugin):
         # 3.0 下先刷新会话镜像（2.x 直通不做事）；同步合并链路只读镜像
         from .session_mirror import refresh_mirror
         try:
-            await refresh_mirror(self.session_mgr)
+            await refresh_mirror(getattr(self.ctx, "session_mgr", None))
         except Exception:
             pass
 
@@ -2197,7 +2241,7 @@ class SessionMergerPlugin(BasePlugin):
         """每次回复后检查是否需要继续后台压缩（阈值触发）。"""
         from .session_mirror import refresh_mirror
         try:
-            await refresh_mirror(self.session_mgr)
+            await refresh_mirror(getattr(self.ctx, "session_mgr", None))
         except Exception:
             pass
         if not self.enabled or not self.engine:

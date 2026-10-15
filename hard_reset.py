@@ -98,22 +98,13 @@ def read_reset_parts(session_mgr, sid: str, keep_turns: int) -> dict:
         return result
     keep_turns = max(1, int(keep_turns or 1))
     try:
-        # 只读内存，避免 fetch_memory 的 _ensure_session_data 写盘
-        data = getattr(session_mgr, "chat_memory", None)
-        if not isinstance(data, dict) or sid not in data:
+        # 双世代只读（与 hard_reset_session 同一路径）：
+        #   2.x 直读 live chat_memory；3.0 走 SessionMirror（由异步入口 refresh_mirror 预热）。
+        # ⚠️ 不得直读 session_mgr.chat_memory —— 3.0 无该属性，会静默拿到空结果
+        #    （症状：reset 照跑但 summary=no，摘要永远不生成）。
+        flat: List[dict] = _norm_messages(safe_fetch_memory(session_mgr, sid) or [])
+        if not flat:
             return result
-        mem_list = (data.get(sid) or {}).get("memory") or []
-        if not isinstance(mem_list, list):
-            return result
-        flat: List[dict] = []
-        for chunk in mem_list:
-            if not isinstance(chunk, list):
-                continue
-            for m in chunk:
-                if isinstance(m, dict):
-                    flat.append(m)
-                elif hasattr(m, "to_dict"):
-                    flat.append(m.to_dict())
         head_text, rest = _split_head_summary(flat)
         chunks = _clean_and_chunk(rest)
         kept = chunks[-keep_turns:] if len(chunks) > keep_turns else chunks[:]

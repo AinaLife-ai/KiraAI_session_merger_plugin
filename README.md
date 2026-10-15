@@ -2,7 +2,7 @@
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_session_merger_plugin)
 
-**版本 2.9.0** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2、3.0 全系列）
+**版本 2.9.1** · 适用于 KiraAI `core >= 2.29.6`（含 v2.34.2、3.0 全系列）
 
 > 装上它，你的 AI 在哪个群、哪个私聊都是**同一个人**——记得跨会话的经历，分得清"现在在跟谁说话"。
 >
@@ -374,6 +374,19 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
+
+### 2.9.1
+
+- **兼容 KiraAI 3.0 GA 弃用面**：批次事件构造 `message_types=` 改双世代字段探测（3.0=`supported_elements`，2.x=`message_types`）；`ctx.message_processor.send_message_chain` → `ctx.send_message_chain`（两代等价）
+- **修复 3.0 上七个潜伏行为 bug**（2.x 下无症状，3.0 才会发作）：
+  - `read_reset_parts` / `_session_has_messages` 直读 3.0 已移除的 `chat_memory` ⇒ 改走镜像层（修复前 3.0 上**摘要永远不生成**、截断保活判定失灵）
+  - 手动压缩重开（`/reboota` 路径）线程区写入没传 defer 队列 ⇒ 3.0 上**手动重开/摘要写入被整笔跳过**
+  - `apply_to_request` 的镜像刷新移到预检**之前**（顺序错会拿旧镜像判定，漏掉刚到的消息）
+  - `_continuous_compress_run` 入口补镜像刷新（后台任务不再读空镜像）
+  - 订阅 `session_memory_updated`（追加事件）让镜像随新消息失效（框架两代都发这个事件，之前只订了 written）
+  - 6 处 `refresh_mirror(self.session_mgr)` 引用了**不存在的属性**（插件只有 `ctx.session_mgr`）——2.x 下刷新是 no-op 所以无症状，3.0 下被静默吞掉 ⇒ 镜像永不刷新
+- 测试双世代化：3.0 用临时 sqlite 真库驱动 SessionManager；2.x 33/33、3.0 GA 32/32（T1 为 2.x 专属竞态，GA 明示跳过）
+- 版本 2.9.0 → 2.9.1
 
 ### 2.9.0
 

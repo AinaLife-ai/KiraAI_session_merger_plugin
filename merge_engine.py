@@ -790,6 +790,11 @@ class MergeEngine:
             async with self._preheat_sem:
                 if self.session_mgr is None:
                     return
+                # 双世代：本任务是异步入口，按镜像契约先预热再读
+                # （3.0 读 SessionMirror；2.x 直通 no-op）。
+                # 否则后台/预热路径会读到空或过期镜像 ⇒ dropped=空 ⇒ 摘要永远不生成。
+                from .session_mirror import refresh_mirror
+                await refresh_mirror(self.session_mgr, force=True)
                 parts = read_reset_parts(self.session_mgr, sid, self.merge_keep_turns)
                 head_text = parts.get("head_text", "")
                 dropped = parts.get("dropped", [])
@@ -1361,11 +1366,12 @@ class MergeEngine:
     def _session_has_messages(self, sid: str) -> bool:
         """会话除可能的摘要头外是否仍有其它消息（用于截断保活判定）。"""
         try:
-            data = getattr(self.session_mgr, "chat_memory", None)
-            if not isinstance(data, dict) or sid not in data:
-                return False
-            mem = (data.get(sid) or {}).get("memory") or []
-            if not isinstance(mem, list) or not mem:
+            # 双世代只读：2.x 直读 chat_memory；3.0 走 SessionMirror。
+            # ⚠️ 不得直读 session_mgr.chat_memory —— 3.0 无该属性，会恒判 False
+            #    （截断保活判定被带偏）。
+            from .memory_access import safe_read_memory
+            mem = safe_read_memory(self.session_mgr, sid) or []
+            if not mem:
                 return False
             if len(mem) > 1:
                 return True
@@ -1649,6 +1655,12 @@ class MergeEngine:
         摘要仍受 summarize_mode 控制（off = 只重开不摘要）。
         返回 {"members", "keep", "ok", "fail", "summarized"}。
         """
+        # 双世代：本方法是异步入口（命令直调），按镜像契约先刷新再读
+        # （否则 3.0 上镜像没有该会话 ⇒ dropped 为空 ⇒ 重开把记忆写成空）。
+        try:
+            await refresh_mirror(self.session_mgr, force=True)
+        except Exception:
+            pass
         members = self._member_sids(current_sid)
         group_id = self._group_id(current_sid)
         keep = self._clamp_keep(self.merge_keep_turns)
@@ -1681,6 +1693,7 @@ class MergeEngine:
 
         # per-group 锁：与自动 hard 重开互斥（自动发生在 to_thread 的 _apply_sync 里）
         # 事件循环侧经 _async_reset_lock 获取；N×全量落盘整体挪到线程
+        defer_q: list = []
         async with self._async_reset_lock(group_id):
             results = await asyncio.to_thread(
                 hard_reset_members,
@@ -1690,7 +1703,11 @@ class MergeEngine:
                 logger=self.logger,
                 summary_chunks=summary_chunks or None,
                 write_through=self.write_through,
+                defer=defer_q,  # 3.0 异步写必须入队；2.x 忽略（直写）
             )
+        # 3.0：线程区不能 await，写操作进了 defer 队列 —— 这里冲刷落盘。
+        # （修复前这里没传队列 ⇒ GA 上手动重开/摘要写入被整笔跳过。）
+        await flush_deferred(self.session_mgr, defer_q, logger=self.logger)
         ok = sum(1 for v in results.values() if isinstance(v, int) and v >= 0)
         fail = len(results) - ok
 
@@ -1738,6 +1755,13 @@ class MergeEngine:
         }
 
     async def apply_to_request(self, event, req: LLMRequest) -> bool:
+        # 双世代：预检/收割都要读镜像 ⇒ 入口**先刷新再读**（顺序修复：之前在预检之后）。
+        # 用 TTL 门控而非 force：写入侧已有 session_memory_updated 事件驱动失效
+        # （main.py 订阅），TTL 兜底 ⇒ 新鲜度与读放大两全；2.x 直通 no-op。
+        try:
+            await refresh_mirror(self.session_mgr)
+        except Exception:
+            pass
         # 硬重开前摘要预检（只读，不改状态；失败不影响主流程）
         summary_chunks: Optional[dict] = None
         sync_finals: dict = {}
@@ -1785,7 +1809,6 @@ class MergeEngine:
 
         out_info: dict = {}
         defer_q: list = []
-        await refresh_mirror(self.session_mgr)
         _task = asyncio.ensure_future(asyncio.to_thread(
             self._apply_sync, event, req, summary_chunks, out_info, sync_finals, defer_q
         ))
