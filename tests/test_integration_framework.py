@@ -23,6 +23,7 @@ Run:
 """
 import argparse
 import asyncio
+import inspect
 import importlib.util
 import json
 import os
@@ -126,7 +127,20 @@ def main():
     client = FakeLLM()
     cfg = KiraConfig()
     cfg["bot_config"]["bot"]["max_memory_length"] = 50
-    sess = SessionManager(db=None, kira_config=cfg, event_bus=None)
+    # 双世代：3.0 的 SessionManager 经 DatabaseService 持久化（db=None 会在
+    # get_sessions 时报 None.list_chat_sessions）；2.x 是文件式，db 用不到。
+    # 探测 core.db.db_mgr：存在即 3.0 ⇒ 起一个临时 sqlite 真库。
+    if hasattr(SessionManager, "initialize"):  # 3.0：SessionManager 走 DatabaseService
+        from core.db.db_mgr import DatabaseManager
+        from core.db.service import DatabaseService
+        _dbm = DatabaseManager(f"sqlite+aiosqlite:///{data_dir}/it_session_merger.db")
+        _dbs = DatabaseService(_dbm)
+        asyncio.run(_dbm.init())
+        asyncio.run(_dbs.init_tables())
+        sess = SessionManager(db=_dbs, kira_config=cfg, event_bus=None)
+        asyncio.run(sess.initialize())
+    else:
+        sess = SessionManager(db=None, kira_config=cfg, event_bus=None)
 
     class FakePluginMgr:
         def has_plugin(self, pid=None): return False
@@ -157,6 +171,11 @@ def main():
         ctx.adapter_mgr = FakeAdapterMgr()
         ctx.tool_mgr = FuncToolManager(cfg)
         ctx.event_bus = bus
+        # 镜像真 PluginContext：ctx 级发送就是委托给 message_processor（GA 起
+        # message_processor 侧同名方法已弃用，插件应调这里）
+        async def _send(session=None, chain=None, _mp=ctx.message_processor, **kw):
+            return await _mp.send_message_chain(session=session, chain=chain, **kw)
+        ctx.send_message_chain = _send
         ctx.get_plugin_data_dir = lambda: data_dir / "plugin_data" / "ksm"
         ctx.get_llm_client = lambda model_uuid=None, llm_type=None: client
         ctx.get_default_fast_llm_client = lambda: client
@@ -164,8 +183,13 @@ def main():
         return ctx
 
     # ── A/E：真实 PluginManager 加载 + 事件 ──
-    from core.plugin.plugin_registry import PluginManager
-    from core.plugin.plugin_handlers import event_handler_reg, EventType
+    try:
+        from core.plugin.plugin_registry import PluginManager
+        from core.plugin.plugin_handlers import event_handler_reg, EventType
+    except ModuleNotFoundError:
+        # 3.0 GA：模块搬家（plugin_registry → manager，plugin_handlers → handlers）
+        from core.plugin.manager import PluginManager
+        from core.plugin.handlers import event_handler_reg, EventType
 
     plugin_dir = data_dir / "plugins" / "kira_session_merger"
     plugin_dir.mkdir(parents=True)
@@ -233,12 +257,49 @@ def main():
 
     logger = get_logger("ksm_it", "cyan")
 
-    def seed(sid, n, tag, size=150, start=0):
+    async def seed(sid, n, tag, size=150, start=0):
         for i in range(start, start + n):
-            sess.update_memory(sid, [
+            _r = sess.update_memory(sid, [
                 {"role": "user", "content": f"[m{tag}{i}] 用户第{i}轮" + "问" * size},
                 {"role": "assistant", "content": f"[m{tag}{i}] 助手第{i}轮" + "答" * size},
             ])
+            if inspect.isawaitable(_r):      # 3.0 的 update_memory 是异步；2.x 同步
+                await _r
+        # 生产里框架发 session_memory_updated → 插件让镜像失效；本测试直驱引擎、
+        # 事件总线不泵送 ⇒ 手动失效（3.0 镜像）；2.x live dict 下这是 no-op。
+        from plugins.ksm_it.session_mirror import invalidate_mirror
+        invalidate_mirror(sess)
+
+    async def sm_refresh():
+        """直驱引擎的测试点：模拟生产里"异步入口先刷新镜像"的契约。"""
+        from plugins.ksm_it.session_mirror import refresh_mirror
+        await refresh_mirror(sess, force=True)
+
+    async def sm_fetch_flat(sid):
+        """双世代读平铺记忆：2.x fetch_memory（同步）；3.0 get_session+flatten_content。"""
+        fetch = getattr(sess, "fetch_memory", None)
+        if fetch is not None:
+            return fetch(sid)
+        rec = await sess.get_session(sid)
+        if rec is None:
+            return []
+        flat = getattr(rec, "flatten_content", None)
+        if callable(flat):
+            return flat()
+        out = []
+        for chunk in (getattr(rec, "content", None) or []):
+            if isinstance(chunk, list):
+                out.extend(m for m in chunk if isinstance(m, dict))
+            elif isinstance(chunk, dict):
+                out.append(chunk)
+        return out
+
+    async def sm_chunk_count(sid):
+        gmc = getattr(sess, "get_memory_count", None)
+        if gmc is not None:
+            return gmc(sid)
+        rec = await sess.get_session(sid)
+        return len(getattr(rec, "content", None) or []) if rec is not None else 0
 
     def make_engine(mode="hard", keep=2, window=50, limit=999999, strategy="append_then_merge",
                     trigger="tokens", summarize="sync", check_interval=0, reset_cmd=False):
@@ -278,7 +339,7 @@ def main():
         # H：收割链（完成后可取回 + 锚点对齐）
         eng, store = make_engine(keep=2, window=50)
         sid = "adh:dm:it_h"
-        seed(sid, 8, "A")
+        await seed(sid, 8, "A")
         eng._schedule_continuous_compression(sid)
         t = eng._preheat_tasks.get(sid)
         if t:
@@ -290,7 +351,7 @@ def main():
         final1, delta1 = eng._preheat_status(sid, parts["dropped"], parts["head_text"], eng._group_id(sid))
         check("H2 同状态收割：final 有效且 delta 为空", bool(final1) and delta1 == [])
         old_dropped = parts["dropped"]
-        seed(sid, 1, "A", start=90)  # 状态前移一格：新轮仍在保留区，A6 轮新落入 dropped
+        await seed(sid, 1, "A", start=90)  # 状态前移一格：新轮仍在保留区，A6 轮新落入 dropped
         parts2 = me.read_reset_parts(sess, sid, eng.merge_keep_turns)
         final2, delta2 = eng._preheat_status(sid, parts2["dropped"], parts2["head_text"], eng._group_id(sid))
         expected_delta = parts2["dropped"][len(old_dropped):]
@@ -303,7 +364,7 @@ def main():
 
         # H4：sync_wait 等待路径
         sid4 = "adh4:dm:it_h4"
-        seed(sid4, 8, "B")
+        await seed(sid4, 8, "B")
         gate = asyncio.Event()
         client.gate = gate
         eng._schedule_continuous_compression(sid4)
@@ -321,17 +382,21 @@ def main():
         # S：滑窗增量
         eng_s, _ = make_engine(keep=2, window=6, limit=999999)
         sid_s = "ads:dm:it_s"
-        seed(sid_s, 6, "W", size=300)
+        await seed(sid_s, 6, "W", size=300)
         c0 = len(client.calls)
         eng_s._schedule_continuous_compression(sid_s)
         t = eng_s._preheat_tasks.get(sid_s)
         if t:
             await asyncio.wait_for(t, 10)
         run1 = client.calls[c0:]
-        sess.update_memory(sid_s, [
+        _r = sess.update_memory(sid_s, [
             {"role": "user", "content": "[mW6] 用户新轮" + "问" * 300},
             {"role": "assistant", "content": "[mW6] 助手新轮" + "答" * 300},
         ])
+        if inspect.isawaitable(_r):
+            await _r
+        from plugins.ksm_it.session_mirror import invalidate_mirror as _inv
+        _inv(sess)
         c1 = len(client.calls)
         eng_s._schedule_continuous_compression(sid_s)
         t = eng_s._preheat_tasks.get(sid_s)
@@ -358,15 +423,15 @@ def main():
         eng3, store3 = make_engine(mode="hard", keep=6, window=50, limit=100,
                                    strategy="immediate", summarize="sync")
         sid3 = "adk:dm:it_k3"
-        seed(sid3, 12, "C", size=120)
+        await seed(sid3, 12, "C", size=120)
         ok1 = await eng3.apply_to_request(mk_event(sid3), LLMRequest(messages=[]))
-        head1 = str(sess.fetch_memory(sid3)[0].get("content", ""))
+        head1 = str((await sm_fetch_flat(sid3))[0].get("content", ""))
         gid3 = eng3._group_id(sid3)
         eng3._soft_state._last_reset[gid3] = time.time() - 200
-        seed(sid3, 6, "D", size=120)
+        await seed(sid3, 6, "D", size=120)
         ok2 = await eng3.apply_to_request(mk_event(sid3), LLMRequest(messages=[]))
         await asyncio.sleep(0.2)
-        flat3 = sess.fetch_memory(sid3)
+        flat3 = await sm_fetch_flat(sid3)
         head2 = str(flat3[0].get("content", ""))
         all_txt = " ".join(str(m.get("content", "")) for m in flat3)
         covered = all(f"[mD{i}]" for i in range(3) if f"[mD{i}]" in head2)
@@ -390,7 +455,8 @@ def main():
         # P：预热门控
         eng_p, _ = make_engine(mode="soft", keep=1, window=50, limit=10, reset_cmd=False)
         sid_p = "adp:dm:it_p"
-        seed(sid_p, 3, "P")
+        await seed(sid_p, 3, "P")
+        await sm_refresh()
         r1 = eng_p._should_compress_continuously(sid_p)
         eng_p.reset_command_enabled = True
         r2 = eng_p._should_compress_continuously(sid_p)
@@ -404,40 +470,43 @@ def main():
         eng_t, store_t = make_engine(mode="hard", keep=2, window=50, limit=100,
                                      strategy="immediate", summarize="sync")
         sid_t = "adt:dm:it_t"
-        seed(sid_t, 8, "E", size=120)
-        orig_write = sess.write_memory
+        await seed(sid_t, 8, "E", size=120)
+        if hasattr(sess, "write_memory"):
+            orig_write = sess.write_memory
 
-        def slow_write(*a, **k):
-            time.sleep(0.7)
-            return orig_write(*a, **k)
+            def slow_write(*a, **k):
+                time.sleep(0.7)
+                return orig_write(*a, **k)
 
-        sess.write_memory = slow_write
-        eng_t._merge_timeout = lambda: 0.25
-        ok_t = await eng_t.apply_to_request(mk_event(sid_t), LLMRequest(messages=[]))
-        await asyncio.sleep(1.8)
-        sess.write_memory = orig_write
-        flat_t = sess.fetch_memory(sid_t)
-        head_t = str(flat_t[0].get("content", "")) if flat_t else ""
-        head_text_t = extract_summary_text(head_t) if head_t.startswith("[前情摘要") else ""
-        store_val = store_t.get(sid_t)
-        check("T1★ 超时后线程完成重开，且 store 与磁盘一致（线程内同步）",
-              ok_t is False and sess.get_memory_count(sid_t) <= 3
-              and bool(head_text_t) and store_val == head_text_t,
-              f"ok={ok_t} chunks={sess.get_memory_count(sid_t)} store==head={store_val == head_text_t}")
+            sess.write_memory = slow_write
+            eng_t._merge_timeout = lambda: 0.25
+            ok_t = await eng_t.apply_to_request(mk_event(sid_t), LLMRequest(messages=[]))
+            await asyncio.sleep(1.8)
+            sess.write_memory = orig_write
+            flat_t = await sm_fetch_flat(sid_t)
+            head_t = str(flat_t[0].get("content", "")) if flat_t else ""
+            head_text_t = extract_summary_text(head_t) if head_t.startswith("[前情摘要") else ""
+            store_val = store_t.get(sid_t)
+            check("T1★ 超时后线程完成重开，且 store 与磁盘一致（线程内同步）",
+                  ok_t is False and sess.get_memory_count(sid_t) <= 3
+                  and bool(head_text_t) and store_val == head_text_t,
+                  f"ok={ok_t} chunks={sess.get_memory_count(sid_t)} store==head={store_val == head_text_t}")
+        else:
+            print("  SKIP  T1（2.x 专属 write_memory 同步写竞态；3.0 是异步 update_session 路径，不适用）")
 
         # D1：sync + append_then_merge：收割命中带 delta → 重开后 async 只补差量
         eng_d1, store_d1 = make_engine(mode="hard", keep=2, window=50, limit=100,
                                        strategy="append_then_merge", summarize="sync")
         sid_d1 = "adu:dm:it_d1"
-        seed(sid_d1, 8, "U", size=120)
+        await seed(sid_d1, 8, "U", size=120)
         eng_d1._schedule_continuous_compression(sid_d1)
         t = eng_d1._preheat_tasks.get(sid_d1)
         if t:
             await asyncio.wait_for(t, 10)
-        seed(sid_d1, 1, "U", size=120, start=90)  # 状态前移：U6 落入 dropped（=delta）
+        await seed(sid_d1, 1, "U", size=120, start=90)  # 状态前移：U6 落入 dropped（=delta）
         okd1 = await eng_d1.apply_to_request(mk_event(sid_d1), LLMRequest(messages=[]))
         await asyncio.sleep(1.0)
-        head_d1 = str(sess.fetch_memory(sid_d1)[0].get("content", ""))
+        head_d1 = str((await sm_fetch_flat(sid_d1))[0].get("content", ""))
         head_d1_text = extract_summary_text(head_d1) if head_d1.startswith("[前情摘要") else ""
         store_d1v = store_d1.get(sid_d1)
         ok_sync_delta = (
@@ -452,15 +521,15 @@ def main():
         eng_d2, store_d2 = make_engine(mode="hard", keep=2, window=50, limit=100,
                                        strategy="append_then_merge", summarize="async")
         sid_d2 = "adv:dm:it_d2"
-        seed(sid_d2, 8, "V", size=120)
+        await seed(sid_d2, 8, "V", size=120)
         eng_d2._schedule_continuous_compression(sid_d2)
         t = eng_d2._preheat_tasks.get(sid_d2)
         if t:
             await asyncio.wait_for(t, 10)
-        seed(sid_d2, 1, "V", size=120, start=90)
+        await seed(sid_d2, 1, "V", size=120, start=90)
         okd2 = await eng_d2.apply_to_request(mk_event(sid_d2), LLMRequest(messages=[]))
         await asyncio.sleep(1.0)
-        head_d2 = str(sess.fetch_memory(sid_d2)[0].get("content", ""))
+        head_d2 = str((await sm_fetch_flat(sid_d2))[0].get("content", ""))
         head_d2_text = extract_summary_text(head_d2) if head_d2.startswith("[前情摘要") else ""
         store_d2v = store_d2.get(sid_d2)
         ok_async_delta = (
@@ -475,9 +544,9 @@ def main():
         eng_r, store_r = make_engine(mode="hard", keep=3, window=50, limit=999999,
                                      strategy="immediate", summarize="sync")
         sid_r = "adr:dm:it_r"
-        seed(sid_r, 8, "F", size=120)
+        await seed(sid_r, 8, "F", size=120)
         stats_r = await eng_r.manual_reset_with_summary(sid_r)
-        head_r = str(sess.fetch_memory(sid_r)[0].get("content", ""))
+        head_r = str((await sm_fetch_flat(sid_r))[0].get("content", ""))
         check("R1 手动压缩重开回归（含摘要写入）",
               stats_r.get("ok", 0) >= 1 and head_r.startswith("[前情摘要"),
               f"ok={stats_r.get('ok')} fail={stats_r.get('fail')} head={head_r[:20]!r}")
@@ -552,7 +621,7 @@ def main():
 
         # E4：/reboota 复位引擎暂存（P1 新增接线）——放在最后（会清空测试会话）
         sid_z = "adz:dm:rz"
-        seed(sid_z, 3, "Z")
+        await seed(sid_z, 3, "Z")
         ksm_inst.enabled = True
         ksm_inst.resolver.enabled = True
         ksm_inst.engine._preheat_pending[sid_z] = {"fp": "x", "final": "y"}
@@ -564,7 +633,7 @@ def main():
         check("E4 /reboota 复位引擎暂存与累计摘要",
               sid_z not in ksm_inst.engine._preheat_pending
               and ksm_inst.engine.summary_store.get(sid_z) == ""
-              and sess.get_memory_count(sid_z) == 0)
+              and (await sm_chunk_count(sid_z)) == 0)
 
         # E3：terminate 反订阅（放在最后）
         await pm.terminate(pid)
