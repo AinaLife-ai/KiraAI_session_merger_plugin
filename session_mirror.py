@@ -111,12 +111,28 @@ async def sm_read_flat(sm, sid: str) -> List[dict]:
     return (s.flatten_content() if s else []) or []
 
 
+async def wait_framework_write_lock(sm) -> None:
+    """等框架当前正在进行的会话写入结束。
+
+    3.0 的 update_session 是整段替换；KSM 的读-改-写不在框架 _write_lock 内，
+    可能读到 update_memory 提交前的旧快照。写前先等锁释放，把窗口缩到最小。
+    """
+    lock = getattr(sm, "_write_lock", None)
+    if lock is not None:
+        try:
+            async with lock:
+                pass
+        except Exception:
+            pass
+
+
 async def sm_write_chunks(sm, sid: str, chunks) -> None:
     """整体覆写会话内容（保留标题/描述/能力设置等元数据）。
 
     2.x 保持原有的「同步全量 JSON 落盘挪到线程」语义；3.0 走原生异步 upsert。
     写完同步失效镜像。
     """
+    await wait_framework_write_lock(sm)
     if hasattr(sm, "write_memory"):
         await asyncio.to_thread(sm.write_memory, sid, chunks)
         return
@@ -129,6 +145,7 @@ async def sm_clear(sm, sid: str) -> None:
 
     2.x：write_memory(sid, [])；3.0：update_session(sid, content=[])。
     """
+    await wait_framework_write_lock(sm)
     if hasattr(sm, "write_memory"):
         sm.write_memory(sid, [])
         return

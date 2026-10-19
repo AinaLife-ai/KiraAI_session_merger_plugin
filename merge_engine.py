@@ -282,10 +282,22 @@ class MergeEngine:
             return 10
 
     def _rounds_limit(self) -> int:
-        """rounds 触发的轮数上限：配置优先，0 = 对齐框架窗口。"""
+        """rounds 触发的轮数上限：配置优先，0 = 对齐框架窗口。
+
+        trigger_rounds > 框架窗口时永远到不了（chunk_count 被窗口封顶），
+        按窗口钳制，保证填了也一定能触发。
+        """
+        host = self._host_window()
         if self.merge_trigger_rounds > 0:
+            if self.merge_trigger_rounds > host:
+                if self.logger:
+                    self.logger.warning(
+                        "[MERGER] trigger_rounds=%d > 框架窗口 %d，按窗口钳制",
+                        self.merge_trigger_rounds, host,
+                    )
+                return host
             return self.merge_trigger_rounds
-        return self._host_window()
+        return host
 
     def _members_rounds_over(self, members: List[str]) -> bool:
         """任一成员会话磁盘轮数达到框架窗口（rounds 触发，防止框架直接截断丢信息）。"""
@@ -306,12 +318,12 @@ class MergeEngine:
         """钳制：keep 必须 < 框架窗口，否则重开后第一次 append 就会把
         融合头部摘要截掉（摘要丢失 + 前缀缓存逐轮失效）。与触发模式无关，始终生效。"""
         keep = max(1, int(keep or 1))
-        cap = max(1, self._rounds_limit() - 1)
+        cap = max(1, self._host_window() - 1)
         if keep > cap:
             if self.logger:
                 self.logger.warning(
                     "[MERGER] keep=%d >= 框架窗口 %d，钳制为 %d 防止框架截断头部摘要",
-                    keep, self._rounds_limit(), cap,
+                    keep, self._host_window(), cap,
                 )
             keep = cap
         return keep
@@ -618,6 +630,14 @@ class MergeEngine:
             defer=defer_q,
         )
 
+        # 保留高优先级插件注入的请求级摘要（ADS/reboot 的 marker 头）。
+        # 本函数会 clear() 整个 messages，不保留的话 ADS 的截断摘要桥会被直接丢掉。
+        preserved = []
+        for m in list(req.messages or []):
+            c = getattr(m, "content", None)
+            if isinstance(c, str) and c.startswith(SUMMARY_MARKER):
+                preserved.append(m)
+
         systems = []
         for m in list(req.messages or []):
             if self._role_of(m) == "system":
@@ -633,6 +653,15 @@ class MergeEngine:
 
         req.messages.clear()
         req.messages.extend(list(systems) + list(merged))
+        if preserved:
+            existing = {str(getattr(m, "content", "") or "") for m in req.messages}
+            add = [
+                m for m in preserved
+                if str(getattr(m, "content", "") or "") not in existing
+            ]
+            if add:
+                # 摘要是最早的上下文，放最前面；让 reboot 等插件仍能识别 marker 头
+                req.messages[:0] = add
 
         # -- precheck native media ref file existence -------------------------
         # If a kira_image_ref file was cleaned up by the framework,
