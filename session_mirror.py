@@ -84,6 +84,32 @@ async def refresh_mirror(sm, force: bool = False) -> None:
     await get_mirror(sm).refresh(sm, force=force)
 
 
+async def refresh_mirror_sid(sm, sid: str) -> bool:
+    """只刷新单个会话的镜像条目（3.0）。
+
+    请求级对账发现不一致时用：只拉当前会话（一条 SQL），避免 get_sessions()
+    把所有会话内容都读一遍。返回是否执行了更新。
+    """
+    if sm is None or is_legacy_sync_sm(sm) or not sid:
+        return False
+    s = await sm.get_session(sid, ensure_session=False)
+    data = get_mirror(sm).data
+    if s is None:
+        data.pop(str(sid), None)
+        return True
+    try:
+        ts = int(getattr(s, "updated_at", 0) or 0)
+    except Exception:
+        ts = 0
+    data[str(sid)] = {
+        "title": str(getattr(s, "session_title", "") or ""),
+        "description": str(getattr(s, "session_description", "") or ""),
+        "timestamp": ts,
+        "memory": [list(c) for c in (getattr(s, "content", None) or [])],
+    }
+    return True
+
+
 def invalidate_mirror(sm, sid: Optional[str] = None) -> None:
     """写入/外部变更后调用：sid 级失效或整体打旧（下次入口强制刷新）。"""
     if sm is None or is_legacy_sync_sm(sm):

@@ -1970,7 +1970,9 @@ class SessionMergerPlugin(BasePlugin):
         sm = getattr(self.ctx, "session_mgr", None)
         if sm is None:
             return
-        from .session_mirror import is_legacy_sync_sm, peek_mirror, refresh_mirror
+        from .session_mirror import (
+            is_legacy_sync_sm, peek_mirror, refresh_mirror_sid,
+        )
         from .summarizer import SUMMARY_MARKER
         if is_legacy_sync_sm(sm):
             return
@@ -1995,7 +1997,8 @@ class SessionMergerPlugin(BasePlugin):
                 continue
             req_flat.append(m)
         if [_fp(m) for m in mirror_flat] != [_fp(m) for m in req_flat]:
-            await refresh_mirror(sm, force=True)
+            # 只刷新当前会话，不把全部会话内容重新拉一遍
+            await refresh_mirror_sid(sm, sid)
 
     @on.llm_request(priority=Priority.LOW)
     async def on_llm_request(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
