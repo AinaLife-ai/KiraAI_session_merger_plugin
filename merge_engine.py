@@ -1006,12 +1006,38 @@ class MergeEngine:
         不会被「读旧快照 → 等锁 → 写旧快照」覆盖。
         写回时 wait=False，避免二次等锁导致同样的旧快照问题。
         """
-        if not final or not self.session_mgr:
+        sm = self.session_mgr
+        if not final or not sm:
             return False, ""
+
+        def _fuse(chunks, head_now):
+            summary_msg = build_summary_chunk(final)[0]
+            if chunks and is_summary_chunk(chunks[0]):
+                chunks[0] = [summary_msg] + list(chunks[0][1:])
+            elif chunks:
+                chunks[0] = [summary_msg] + list(chunks[0])
+            else:
+                chunks = [[summary_msg]]
+            return chunks, head_now
+
+        # 2.x：read-modify-write 全同步，段内零 await（事件循环无法插入 update_memory）
+        if hasattr(sm, "read_memory") and hasattr(sm, "write_memory"):
+            chunks = [list(c) for c in (sm.read_memory(sid) or [])]
+            head_now = ""
+            if chunks and is_summary_chunk(chunks[0]):
+                head_now = extract_summary_text(
+                    str(chunks[0][0].get("content", "") or "")
+                )
+            if check_head and (head_now or "").strip() != (expected_head or "").strip():
+                return False, head_now
+            chunks, _ = _fuse(chunks, head_now)
+            sm.write_memory(sid, chunks)
+            return True, head_now
+
         from .session_mirror import wait_framework_write_lock
 
-        await wait_framework_write_lock(self.session_mgr)
-        chunks = await sm_read_chunks(self.session_mgr, sid)
+        await wait_framework_write_lock(sm)
+        chunks = await sm_read_chunks(sm, sid)
         head_now = ""
         if chunks and is_summary_chunk(chunks[0]):
             head_now = extract_summary_text(
@@ -1019,14 +1045,8 @@ class MergeEngine:
             )
         if check_head and (head_now or "").strip() != (expected_head or "").strip():
             return False, head_now
-        summary_msg = build_summary_chunk(final)[0]
-        if chunks and is_summary_chunk(chunks[0]):
-            chunks[0] = [summary_msg] + list(chunks[0][1:])
-        elif chunks:
-            chunks[0] = [summary_msg] + list(chunks[0])
-        else:
-            chunks = [[summary_msg]]
-        await sm_write_chunks(self.session_mgr, sid, chunks, wait=False)
+        chunks, _ = _fuse(chunks, head_now)
+        await sm_write_chunks(sm, sid, chunks, wait=False)
         return True, head_now
 
     async def _replace_summary_in_memory(self, sid, old_final, new_final, group_id):
