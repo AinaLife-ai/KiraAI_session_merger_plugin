@@ -1960,6 +1960,46 @@ class SessionMergerPlugin(BasePlugin):
 
     # ── core merge ───────────────────────────────────────────
 
+    async def _ensure_mirror_fresh(self, event, req) -> None:
+        """请求级镜像新鲜度校验（3.0）。
+
+        TTL 1.5s 内如果别的插件（ADS / reboot）刚改过记忆，事件失效可能还没被调度；
+        这里用当前请求的 messages 与镜像做一次轻量对账，不一致就强制刷新。
+        请求级摘要注入（marker 开头）不在磁盘镜像里，对账时忽略。
+        """
+        sm = getattr(self.ctx, "session_mgr", None)
+        if sm is None:
+            return
+        from .session_mirror import (
+            is_legacy_sync_sm, peek_mirror, refresh_mirror_sid,
+        )
+        from .summarizer import SUMMARY_MARKER
+        if is_legacy_sync_sm(sm):
+            return
+        sid = getattr(event, "sid", "") or ""
+        if not sid:
+            return
+
+        def _fp(m):
+            if isinstance(m, dict):
+                role, c = m.get("role", ""), m.get("content", "")
+            else:
+                role, c = getattr(m, "role", ""), getattr(m, "content", "")
+            text = c if isinstance(c, str) else str(c)
+            return (role, text[:200])
+
+        data = (peek_mirror(sm) or {}).get(sid) or {}
+        mirror_flat = [m for c in (data.get("memory") or []) for m in c]
+        req_flat = []
+        for m in (req.messages or []):
+            c = getattr(m, "content", "")
+            if isinstance(c, str) and c.startswith(SUMMARY_MARKER):
+                continue
+            req_flat.append(m)
+        if [_fp(m) for m in mirror_flat] != [_fp(m) for m in req_flat]:
+            # 只刷新当前会话，不把全部会话内容重新拉一遍
+            await refresh_mirror_sid(sm, sid)
+
     @on.llm_request(priority=Priority.LOW)
     async def on_llm_request(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         if not self.enabled or not self.engine:
@@ -1968,6 +2008,11 @@ class SessionMergerPlugin(BasePlugin):
         from .session_mirror import refresh_mirror
         try:
             await refresh_mirror(getattr(self.ctx, "session_mgr", None))
+        except Exception:
+            pass
+        # 外部插件刚改过记忆时，TTL 内镜像可能还是旧的：请求级对账
+        try:
+            await self._ensure_mirror_fresh(event, req)
         except Exception:
             pass
 

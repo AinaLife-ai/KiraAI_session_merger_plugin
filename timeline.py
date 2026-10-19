@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple  # Tuple used by sort atoms
 from core.agent.message import OpenAIMessage
 
 from .memory_access import safe_fetch_memory, safe_session_meta
+from .summarizer import SUMMARY_MARKER
 
 
 @dataclass
@@ -384,6 +385,9 @@ class TimelineBuilder:
         if mode == "none" or not source_sid:
             return ""
         if role == "tool":
+            return ""
+        # 摘要消息保持 marker 开头：reboot/ADS 靠它识别头部摘要，加前缀会导致重复注入
+        if role == "user" and isinstance(content, str) and content.startswith(SUMMARY_MARKER):
             return ""
         # 对齐官方：assistant 历史从不带会话前缀，避免模型学样输出污染落盘
         if role == "assistant":

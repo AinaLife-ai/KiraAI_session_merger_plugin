@@ -375,6 +375,15 @@ A：会删除旧记录。但摘要保留了关键信息。担心的话先用 sof
 <details>
 <summary><strong>更新日志 Changelog</strong></summary>
 
+### 2.9.2
+
+- **保留高优先级插件的请求级摘要（P0）**：`_apply_sync` 会 `clear()` 整个 `req.messages` 再从镜像重建；现在先把 marker 开头的摘要消息收集起来、重建后补回最前面。否则 ADS 的截断摘要桥会被直接丢掉（实测 `ADS-BRIDGE-SUMMARY` 消失）。
+- **摘要消息不再加 `[session:]` 前缀**：`_format_source_prefix` 对 `[前情摘要|系统注入]` 开头的 user 消息返回空前缀。否则 reboot 等靠 marker 识别摘要头的插件认不出，最终请求会出现两份摘要（实测 2 份 → 修复后 1 份）。
+- **rounds / keep 钳制修正**：`merge_trigger_rounds > 框架窗口` 按窗口钳制（不再永不触发）；`_clamp_keep` 改用真实窗口，避免重开后头部摘要被下一次 append 截掉。
+- **后台写回加框架写锁等待**：`sm_write_chunks` / `sm_clear` 写前等 `SessionManager._write_lock` 释放，缩小 3.0 整段替换与 finalize 追加的读改写窗口。
+- **镜像请求级新鲜度**：`on_llm_request` 在 TTL 刷新后用当前请求的 messages 与镜像对账，不一致就强制刷新。外部插件（ADS/reboot）刚改过记忆时，不会再在 1.5s TTL 内读到旧镜像。
+- 全量测试（29/15/32/110/70/26/10）通过。
+
 ### 2.9.1
 
 - **兼容 KiraAI 3.0 GA 弃用面**：批次事件构造 `message_types=` 改双世代字段探测（3.0=`supported_elements`，2.x=`message_types`）；`ctx.message_processor.send_message_chain` → `ctx.send_message_chain`（两代等价）

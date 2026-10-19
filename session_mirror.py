@@ -84,6 +84,32 @@ async def refresh_mirror(sm, force: bool = False) -> None:
     await get_mirror(sm).refresh(sm, force=force)
 
 
+async def refresh_mirror_sid(sm, sid: str) -> bool:
+    """只刷新单个会话的镜像条目（3.0）。
+
+    请求级对账发现不一致时用：只拉当前会话（一条 SQL），避免 get_sessions()
+    把所有会话内容都读一遍。返回是否执行了更新。
+    """
+    if sm is None or is_legacy_sync_sm(sm) or not sid:
+        return False
+    s = await sm.get_session(sid, ensure_session=False)
+    data = get_mirror(sm).data
+    if s is None:
+        data.pop(str(sid), None)
+        return True
+    try:
+        ts = int(getattr(s, "updated_at", 0) or 0)
+    except Exception:
+        ts = 0
+    data[str(sid)] = {
+        "title": str(getattr(s, "session_title", "") or ""),
+        "description": str(getattr(s, "session_description", "") or ""),
+        "timestamp": ts,
+        "memory": [list(c) for c in (getattr(s, "content", None) or [])],
+    }
+    return True
+
+
 def invalidate_mirror(sm, sid: Optional[str] = None) -> None:
     """写入/外部变更后调用：sid 级失效或整体打旧（下次入口强制刷新）。"""
     if sm is None or is_legacy_sync_sm(sm):
@@ -111,12 +137,28 @@ async def sm_read_flat(sm, sid: str) -> List[dict]:
     return (s.flatten_content() if s else []) or []
 
 
+async def wait_framework_write_lock(sm) -> None:
+    """等框架当前正在进行的会话写入结束。
+
+    3.0 的 update_session 是整段替换；KSM 的读-改-写不在框架 _write_lock 内，
+    可能读到 update_memory 提交前的旧快照。写前先等锁释放，把窗口缩到最小。
+    """
+    lock = getattr(sm, "_write_lock", None)
+    if lock is not None:
+        try:
+            async with lock:
+                pass
+        except Exception:
+            pass
+
+
 async def sm_write_chunks(sm, sid: str, chunks) -> None:
     """整体覆写会话内容（保留标题/描述/能力设置等元数据）。
 
     2.x 保持原有的「同步全量 JSON 落盘挪到线程」语义；3.0 走原生异步 upsert。
     写完同步失效镜像。
     """
+    await wait_framework_write_lock(sm)
     if hasattr(sm, "write_memory"):
         await asyncio.to_thread(sm.write_memory, sid, chunks)
         return
@@ -129,6 +171,7 @@ async def sm_clear(sm, sid: str) -> None:
 
     2.x：write_memory(sid, [])；3.0：update_session(sid, content=[])。
     """
+    await wait_framework_write_lock(sm)
     if hasattr(sm, "write_memory"):
         sm.write_memory(sid, [])
         return
