@@ -997,29 +997,49 @@ class MergeEngine:
             parts = parts[1:]
         return parts
 
+    async def _write_summary_head_safe(
+        self, sid: str, expected_head: str, final: str, *, check_head: bool = True
+    ):
+        """等框架写锁 → 重读 → 头部校验 → 写回。返回 (applied, head_now)。
+
+        关键：读发生在等锁之后，框架刚 append 的回合会被包含进来，
+        不会被「读旧快照 → 等锁 → 写旧快照」覆盖。
+        写回时 wait=False，避免二次等锁导致同样的旧快照问题。
+        """
+        if not final or not self.session_mgr:
+            return False, ""
+        from .session_mirror import wait_framework_write_lock
+
+        await wait_framework_write_lock(self.session_mgr)
+        chunks = await sm_read_chunks(self.session_mgr, sid)
+        head_now = ""
+        if chunks and is_summary_chunk(chunks[0]):
+            head_now = extract_summary_text(
+                str(chunks[0][0].get("content", "") or "")
+            )
+        if check_head and (head_now or "").strip() != (expected_head or "").strip():
+            return False, head_now
+        summary_msg = build_summary_chunk(final)[0]
+        if chunks and is_summary_chunk(chunks[0]):
+            chunks[0] = [summary_msg] + list(chunks[0][1:])
+        elif chunks:
+            chunks[0] = [summary_msg] + list(chunks[0])
+        else:
+            chunks = [[summary_msg]]
+        await sm_write_chunks(self.session_mgr, sid, chunks, wait=False)
+        return True, head_now
+
     async def _replace_summary_in_memory(self, sid, old_final, new_final, group_id):
         """如果框架记忆头部仍是 old_final，则替换为 new_final。"""
         if not new_final or not self.session_mgr:
             return False
         try:
             async with self._async_reset_lock(group_id):
-                chunks = await sm_read_chunks(self.session_mgr, sid)
-                cur_head = ""
-                if chunks and is_summary_chunk(chunks[0]):
-                    cur_head = extract_summary_text(
-                        str(chunks[0][0].get("content", "") or "")
-                    )
-                if (cur_head or "").strip() != (old_final or "").strip():
-                    return False
-                summary_msg = build_summary_chunk(new_final)[0]
-                if chunks and is_summary_chunk(chunks[0]):
-                    chunks[0] = [summary_msg] + list(chunks[0][1:])
-                elif chunks:
-                    chunks[0] = [summary_msg] + list(chunks[0])
-                else:
-                    chunks = [[summary_msg]]
-                # 双世代：2.x 同步全量落盘挪线程；3.0 原生异步 upsert（见 session_mirror）
-                await sm_write_chunks(self.session_mgr, sid, chunks)
+                applied, _head_now = await self._write_summary_head_safe(
+                    sid, old_final, new_final
+                )
+            if not applied:
+                return False
             self._update_store_after_reset([sid], {sid: new_final})
             if self.logger:
                 self.logger.info(
@@ -1304,16 +1324,11 @@ class MergeEngine:
             return
         try:
             async with self._async_reset_lock(group_id):
-                chunks = await sm_read_chunks(self.session_mgr, sid)
-                summary_msg = build_summary_chunk(final)[0]
-                if chunks and is_summary_chunk(chunks[0]):
-                    chunks[0] = [summary_msg] + list(chunks[0][1:])
-                elif chunks:
-                    chunks[0] = [summary_msg] + list(chunks[0])
-                else:
-                    chunks = [[summary_msg]]
-                # 双世代：2.x 同步全量落盘挪线程；3.0 原生异步 upsert（见 session_mirror）
-                await sm_write_chunks(self.session_mgr, sid, chunks)
+                applied, _head_now = await self._write_summary_head_safe(
+                    sid, "", final, check_head=False
+                )
+            if not applied:
+                return
             self._update_store_after_reset([sid], {sid: final})
             if self.logger:
                 self.logger.info("[MERGER summary] async summary written for %s", sid)
@@ -1601,22 +1616,10 @@ class MergeEngine:
                     # （threading.Lock 在事件循环里等待 LLM 会阻塞整个 loop）
                     for _attempt in range(2):
                         async with self._async_reset_lock(group_id):
-                            chunks = await sm_read_chunks(self.session_mgr, sid)
-                            cur_head = ""
-                            if chunks and is_summary_chunk(chunks[0]):
-                                cur_head = extract_summary_text(
-                                    str(chunks[0][0].get("content", "") or "")
-                                )
-                            if (cur_head or "") == (base or ""):
-                                summary_msg = build_summary_chunk(final)[0]
-                                if chunks and is_summary_chunk(chunks[0]):
-                                    chunks[0] = [summary_msg] + list(chunks[0][1:])
-                                elif chunks:
-                                    chunks[0] = [summary_msg] + list(chunks[0])
-                                else:
-                                    chunks = [[summary_msg]]
-                                # 双世代：2.x 同步全量落盘挪线程；3.0 原生异步 upsert
-                                await sm_write_chunks(self.session_mgr, sid, chunks)
+                            applied, cur_head = await self._write_summary_head_safe(
+                                sid, base, final
+                            )
+                            if applied:
                                 self._update_store_after_reset([sid], {sid: final})
                                 if self.logger:
                                     self.logger.info(
